@@ -11,27 +11,107 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 /**
  * One place where every exception becomes an HTTP response, using RFC 7807
  * problem details.
  *
- * <p>Layer 2 adds the failure modes a database brings with it. Each mapping
- * below is a deliberate choice of status code, and each is worth being able to
- * defend - "what status would you return for X" is a standard API interview
- * question and the interesting part is always the reasoning.
+ * <p><b>Layer 3 fixed the defect this class shipped with.</b> In Layers 1 and 2 it
+ * had a catch-all {@code @ExceptionHandler(Exception.class)} and nothing above it
+ * to stop that handler eating Spring's own exceptions. So a request to a path
+ * that does not exist - which Spring correctly raises as
+ * {@code NoResourceFoundException}, a 404 - was caught by the catch-all and served
+ * as a <b>500</b>. Same for an unsupported HTTP method (should be 405) and an
+ * unreadable body. Client mistakes were being reported as server failures, which
+ * means alerts firing for things that are not broken, and a genuine outage lost in
+ * the noise.
+ *
+ * <p><b>The fix is to extend {@link ResponseEntityExceptionHandler}.</b> That base
+ * class declares handlers for every Spring MVC exception and - since Spring
+ * Framework 6 - already renders them as RFC 7807 problem details with the correct
+ * status. Because Spring dispatches to the <em>most specific</em> matching
+ * handler, those now win over our {@code Exception} catch-all, which is reduced to
+ * its proper job: genuinely unexpected failures.
+ *
+ * <p>We override two of the base handlers, not to change their status but to
+ * enrich the body - a field-by-field error map for validation failures, and a
+ * clearer title for malformed JSON. Everything else we inherit, correctly, for
+ * free.
+ *
+ * <p>Each status code below is a deliberate choice worth defending. "What would
+ * you return for X" is a standard API interview question and the reasoning is
+ * always the interesting part.
  */
 @RestControllerAdvice
-public class GlobalExceptionHandler {
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
     private static final String PROBLEM_BASE = "https://atlas-liquidity.example.com/problems/";
+
+    // --- overrides of Spring MVC's own handlers ---------------------------
+
+    /**
+     * Bean Validation failures from {@code @Valid}.
+     *
+     * <p>The base class already returns 400. We override only to add a
+     * field-by-field map, because a client submitting a form needs to know
+     * <em>which</em> field to highlight, not just that something was wrong. RFC
+     * 7807 allows arbitrary extension members for exactly this.
+     */
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+            MethodArgumentNotValidException ex,
+            HttpHeaders headers,
+            HttpStatusCode status,
+            WebRequest request) {
+
+        Map<String, String> fieldErrors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+                .forEach(error -> fieldErrors.put(error.getField(), error.getDefaultMessage()));
+
+        log.warn("Rejected an invalid request body: {}", fieldErrors);
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, "The request body failed validation");
+        problem.setTitle("Validation failed");
+        problem.setType(URI.create(PROBLEM_BASE + "validation-failed"));
+        problem.setProperty("errors", fieldErrors);
+        problem.setProperty("timestamp", Instant.now());
+
+        return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
+    }
+
+    /** Malformed or missing JSON body - the caller's fault, so 400 and not 500. */
+    @Override
+    protected ResponseEntity<Object> handleHttpMessageNotReadable(
+            HttpMessageNotReadableException ex,
+            HttpHeaders headers,
+            HttpStatusCode status,
+            WebRequest request) {
+
+        log.warn("Rejected an unreadable request body: {}", ex.getMessage());
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, "Request body is missing or not valid JSON");
+        problem.setTitle("Malformed request body");
+        problem.setType(URI.create(PROBLEM_BASE + "malformed-body"));
+        problem.setProperty("timestamp", Instant.now());
+
+        return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
+    }
+
+    // --- our own domain and infrastructure exceptions ---------------------
 
     @ExceptionHandler(AccountNotFoundException.class)
     public ProblemDetail handleAccountNotFound(AccountNotFoundException ex) {
@@ -46,8 +126,8 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * The domain layer's way of saying "no such thing" - thrown by the
-     * repository adapter, which knows nothing about HTTP and should not.
+     * The domain layer's way of saying "no such thing" - thrown by the repository
+     * adapter, which knows nothing about HTTP and should not.
      */
     @ExceptionHandler(NoSuchElementException.class)
     public ProblemDetail handleNoSuchElement(NoSuchElementException ex) {
@@ -61,22 +141,17 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * A currency invariant was violated - a buffer denominated in something
-     * other than the account's own currency.
+     * A currency invariant was violated - a buffer denominated in something other
+     * than the account's own currency.
      *
-     * <p><b>Why this handler exists at all, which is the interesting part.</b>
-     * The adapter originally threw {@code IllegalArgumentException} here, and it
-     * never reached the handler below. {@code @Repository} enables Spring's
-     * persistence exception translation, and because the JPA specification says
-     * {@code EntityManager} throws {@code IllegalArgumentException} for API
-     * misuse, the translator rewrites <em>any</em>
-     * {@code IllegalArgumentException} leaving a repository into
-     * {@code InvalidDataAccessApiUsageException}. So a validation failure was
-     * silently arriving here as an untyped exception and coming back as a 500.
-     *
-     * <p>The fix was to throw a domain exception the framework has no opinion
-     * about. The moral: a generic JDK exception thrown from inside a framework's
-     * territory is not yours any more.
+     * <p>This handler exists because of a bug worth remembering. The adapter
+     * originally threw {@code IllegalArgumentException}, and it never arrived as
+     * one: {@code @Repository} enables Spring's persistence exception translation,
+     * which - because the JPA spec uses {@code IllegalArgumentException} for API
+     * misuse - rewrites any such exception leaving a repository into
+     * {@code InvalidDataAccessApiUsageException}. So the handler below never
+     * matched and a validation failure came back as a 500. Throwing a domain
+     * exception the framework has no claim on is the fix.
      */
     @ExceptionHandler(CurrencyMismatchException.class)
     public ProblemDetail handleCurrencyMismatch(CurrencyMismatchException ex) {
@@ -92,51 +167,14 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Bean Validation failures from {@code @Valid}.
+     * Optimistic lock failure: someone else changed the row between our read and
+     * our write.
      *
-     * <p>Returns a field-by-field map rather than one flat sentence, because a
-     * client that submits a form needs to know <em>which</em> field to
-     * highlight. RFC 7807 allows arbitrary extension members for exactly this.
-     */
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ProblemDetail handleValidationFailure(MethodArgumentNotValidException ex) {
-        Map<String, String> fieldErrors = new LinkedHashMap<>();
-        ex.getBindingResult().getFieldErrors()
-                .forEach(error -> fieldErrors.put(error.getField(), error.getDefaultMessage()));
-
-        log.warn("Rejected an invalid request body: {}", fieldErrors);
-
-        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
-                HttpStatus.BAD_REQUEST, "The request body failed validation");
-        problem.setTitle("Validation failed");
-        problem.setType(URI.create(PROBLEM_BASE + "validation-failed"));
-        problem.setProperty("errors", fieldErrors);
-        problem.setProperty("timestamp", Instant.now());
-        return problem;
-    }
-
-    /** Malformed or missing JSON body - the caller's fault, so 400 not 500. */
-    @ExceptionHandler(HttpMessageNotReadableException.class)
-    public ProblemDetail handleUnreadableBody(HttpMessageNotReadableException ex) {
-        log.warn("Rejected an unreadable request body: {}", ex.getMessage());
-
-        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
-                HttpStatus.BAD_REQUEST, "Request body is missing or not valid JSON");
-        problem.setTitle("Malformed request body");
-        problem.setType(URI.create(PROBLEM_BASE + "malformed-body"));
-        problem.setProperty("timestamp", Instant.now());
-        return problem;
-    }
-
-    /**
-     * Optimistic lock failure: someone else changed the row between our read
-     * and our write.
-     *
-     * <p><b>409 Conflict, and it matters that it is not 500.</b> Nothing is
-     * broken - the system worked exactly as designed and refused to let one
-     * update silently destroy another. 409 tells the client this is a
-     * retryable, meaningful outcome: re-read the resource and try again. A 500
-     * would tell it to page someone.
+     * <p><b>409 Conflict, and it matters that it is not 500.</b> Nothing is broken
+     * - the system worked as designed and refused to let one update silently
+     * destroy another. 409 tells the client this is a meaningful, retryable
+     * outcome: re-read the resource and try again. A 500 would tell it to page
+     * someone.
      */
     @ExceptionHandler(OptimisticLockingFailureException.class)
     public ProblemDetail handleOptimisticLock(OptimisticLockingFailureException ex) {
@@ -155,9 +193,9 @@ public class GlobalExceptionHandler {
      * A database constraint said no - a unique index, a check constraint, a
      * foreign key.
      *
-     * <p>The message is deliberately vague to the caller. Constraint names and
-     * SQL error text describe your schema, and describing your schema to an
-     * anonymous caller is free reconnaissance.
+     * <p>The message is deliberately vague to the caller. Constraint names and SQL
+     * error text describe your schema, and describing your schema to an anonymous
+     * caller is free reconnaissance.
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ProblemDetail handleDataIntegrityViolation(DataIntegrityViolationException ex) {
@@ -171,16 +209,7 @@ public class GlobalExceptionHandler {
         return problem;
     }
 
-    /**
-     * Belt and braces for the translation trap described above: anything that
-     * still arrives as a translated argument error is the caller's fault, so
-     * 400 rather than 500.
-     *
-     * <p>Note this must be declared as a distinct handler even though
-     * {@code InvalidDataAccessApiUsageException} is a {@code RuntimeException} -
-     * Spring dispatches on the most specific matching handler, and without this
-     * one it would fall through to the catch-all at the bottom.
-     */
+    /** Belt and braces for the exception-translation trap described above. */
     @ExceptionHandler(InvalidDataAccessApiUsageException.class)
     public ProblemDetail handleInvalidDataAccessUsage(InvalidDataAccessApiUsageException ex) {
         log.warn("Rejected an invalid data-access usage: {}", ex.getMessage());
@@ -194,9 +223,9 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Covers bad enum values, unparseable amounts ({@code NumberFormatException}
-     * is an {@code IllegalArgumentException}), and invariant failures raised
-     * outside a repository.
+     * Covers our own parse and range failures: an unknown sort field, an unknown
+     * jurisdiction, a negative page, an oversized page, an unparseable amount
+     * ({@code NumberFormatException} is an {@code IllegalArgumentException}).
      */
     @ExceptionHandler(IllegalArgumentException.class)
     public ProblemDetail handleIllegalArgument(IllegalArgumentException ex) {
@@ -209,6 +238,18 @@ public class GlobalExceptionHandler {
         return problem;
     }
 
+    /**
+     * The genuine last resort.
+     *
+     * <p>Now that {@link ResponseEntityExceptionHandler} sits above this class,
+     * this handler only sees exceptions nobody anticipated - which is exactly what
+     * a 500 should mean. Before Layer 3 it was also catching every 404 and 405,
+     * and that made the metric useless.
+     *
+     * <p>Full detail goes to the log; nothing internal goes to the caller. Leaking
+     * a stack trace discloses your framework versions, package structure and
+     * sometimes SQL.
+     */
     @ExceptionHandler(Exception.class)
     public ProblemDetail handleUnexpected(Exception ex) {
         log.error("Unhandled exception serving request", ex);

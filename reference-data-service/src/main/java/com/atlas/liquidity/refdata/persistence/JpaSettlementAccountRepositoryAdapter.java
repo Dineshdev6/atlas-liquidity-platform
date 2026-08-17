@@ -2,14 +2,16 @@ package com.atlas.liquidity.refdata.persistence;
 
 import com.atlas.liquidity.common.money.CurrencyMismatchException;
 import com.atlas.liquidity.common.money.Money;
-import com.atlas.liquidity.refdata.domain.Jurisdiction;
+import com.atlas.liquidity.common.query.Page;
+import com.atlas.liquidity.common.query.PageRequest;
+import com.atlas.liquidity.common.query.SortDirection;
 import com.atlas.liquidity.refdata.domain.SettlementAccount;
+import com.atlas.liquidity.refdata.domain.SettlementAccountQuery;
 import com.atlas.liquidity.refdata.domain.SettlementAccountRepository;
 import java.util.Currency;
-import java.util.List;
-import java.util.Locale;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,50 +19,31 @@ import org.springframework.transaction.annotation.Transactional;
  * The adapter: implements the domain's port using Hibernate and Postgres.
  *
  * <p>This is the only class that knows both worlds. Everything above it sees
- * immutable {@code SettlementAccount} records; everything below it sees JPA
- * entities. The translation happens here and nowhere else.
+ * immutable records and our own {@code Page}; everything below it sees JPA
+ * entities, {@code Specification} and Spring Data's {@code Pageable}. The
+ * translation happens here and nowhere else - which is why the domain port
+ * mentions no framework type at all.
  *
  * <p><b>{@code @Repository} does more than mark a bean.</b> It also opts this
- * class into Spring's automatic <em>persistence exception translation</em>: a
- * post-processor wraps the bean in a proxy that converts vendor-specific
- * persistence failures into Spring's own {@code DataAccessException} hierarchy.
- * That is genuinely useful - it means the layers above never import a Hibernate
- * or JDBC exception type, so swapping Hibernate for JOOQ would not change a
- * single {@code catch} block anywhere else.
+ * class into Spring's automatic persistence exception translation, converting
+ * vendor-specific failures into Spring's {@code DataAccessException} hierarchy so
+ * the layers above never import a Hibernate type.
  *
- * <p><b>And it has a sharp edge we walked straight into.</b> Because the JPA
+ * <p><b>And it has a sharp edge we walked into in Layer 2.</b> Because the JPA
  * specification says {@code EntityManager} throws {@code IllegalArgumentException}
- * for API misuse, the translator maps <em>any</em>
+ * for API misuse, the translator rewrites <em>any</em>
  * {@code IllegalArgumentException} escaping this class into
- * {@code InvalidDataAccessApiUsageException}. Our own domain validation used to
- * throw {@code IllegalArgumentException} - and it was silently rewritten on the
- * way out, so the {@code @ExceptionHandler(IllegalArgumentException.class)} in
- * the web layer stopped matching and a validation failure came back as a
- * <b>500 instead of a 400</b>.
+ * {@code InvalidDataAccessApiUsageException}. Our currency check used to throw
+ * the former, so it stopped matching the web layer's handler and came back as a
+ * <b>500 instead of a 400</b>. The fix - visible below - is to throw a domain
+ * exception the framework has no opinion about. The lesson generalises: inside a
+ * framework's territory, generic JDK exceptions are not yours.
  *
- * <p>The lesson is worth more than the fix: <b>do not throw generic JDK
- * exceptions from a layer whose framework has claimed them.</b> Throw a domain
- * exception that says what actually went wrong - here
- * {@link CurrencyMismatchException} from {@code liquidity-common} - and nothing
- * can quietly reinterpret it. This is a good, specific answer to "tell me about
- * a bug that surprised you".
- *
- * <p><b>{@code @Transactional(readOnly = true)} on the class.</b> Read-only is
- * not decoration. It tells Hibernate to skip dirty-checking - it does not
- * snapshot every loaded entity or scan for changes at flush time - which is a
- * measurable saving on large result sets. It also lets the JDBC driver mark the
- * connection read-only, which some databases and most connection proxies use to
- * route queries to a read replica. Layer 11 depends on exactly that behaviour.
- * The write method below overrides it.
- *
- * <p><b>Where transaction boundaries belong.</b> Textbook layering puts
- * {@code @Transactional} on an application service, because a transaction
- * should span a complete business operation - and if you have two repository
- * calls that must succeed or fail together, a transaction on each one is
- * exactly wrong. We have no such orchestration yet, so a service class here
- * would be ceremony with no content, and the boundary sits on the adapter.
- * When Layer 5 needs to write a position and publish an event atomically, a
- * real service appears and the boundary moves up.
+ * <p><b>{@code @Transactional(readOnly = true)} on the class.</b> Hibernate skips
+ * dirty-checking, so it does not snapshot loaded entities or scan for changes at
+ * flush - a measurable saving on large result sets. It also lets the driver mark
+ * the connection read-only, which connection proxies use to route to a read
+ * replica. Layer 11 depends on that. The write method overrides it.
  */
 @Repository
 @Transactional(readOnly = true)
@@ -72,29 +55,40 @@ public class JpaSettlementAccountRepositoryAdapter implements SettlementAccountR
         this.jpaRepository = jpaRepository;
     }
 
+    /**
+     * One page of accounts matching the criteria.
+     *
+     * <p><b>What Spring Data actually issues here is two statements, not one.</b>
+     * A {@code SELECT ... LIMIT ? OFFSET ?} for the rows, and a
+     * {@code SELECT count(*)} for {@code totalElements}. That second query is not
+     * free - on a large table it may scan far more than the page you asked for,
+     * and it is the usual reason a paginated endpoint is slower than expected.
+     *
+     * <p>The alternatives are worth knowing: return only "is there a next page"
+     * (fetch {@code size + 1} rows and look at the overflow, no count at all), or
+     * switch to keyset pagination. A UI that renders "page 5 of 400" needs the
+     * count; an infinite scroll does not. We keep the count because a total is
+     * genuinely useful to an operations user, and because six accounts make it
+     * free - but the cost is real and you should be able to name it.
+     */
     @Override
-    public List<SettlementAccount> findAll() {
-        return toDomain(jpaRepository.findAllByOrderByAccountId());
+    public Page<SettlementAccount> search(SettlementAccountQuery query, PageRequest pageRequest) {
+        org.springframework.data.domain.PageRequest springPageRequest =
+                org.springframework.data.domain.PageRequest.of(
+                        pageRequest.page(), pageRequest.size(), toSort(pageRequest));
+
+        org.springframework.data.domain.Page<SettlementAccountEntity> result =
+                jpaRepository.findAll(SettlementAccountSpecifications.matching(query), springPageRequest);
+
+        return Page.of(
+                result.getContent().stream().map(JpaSettlementAccountRepositoryAdapter::toDomain).toList(),
+                pageRequest,
+                result.getTotalElements());
     }
 
     @Override
     public Optional<SettlementAccount> findByAccountId(String accountId) {
         return jpaRepository.findById(accountId).map(JpaSettlementAccountRepositoryAdapter::toDomain);
-    }
-
-    @Override
-    public List<SettlementAccount> findByCurrency(String currencyCode) {
-        // Normalised here so "usd" and "USD" behave the same. Note this is a
-        // real query now, not a stream filter over everything in memory - the
-        // Layer 1 implementation loaded all rows and filtered in Java, which is
-        // fine over six seed accounts and indefensible over six million.
-        String normalised = currencyCode.toUpperCase(Locale.ROOT);
-        return toDomain(jpaRepository.findByCurrencyCodeOrderByAccountId(normalised));
-    }
-
-    @Override
-    public List<SettlementAccount> findByJurisdiction(Jurisdiction jurisdiction) {
-        return toDomain(jpaRepository.findByJurisdictionOrderByAccountId(jurisdiction));
     }
 
     @Override
@@ -104,38 +98,59 @@ public class JpaSettlementAccountRepositoryAdapter implements SettlementAccountR
                 .orElseThrow(() -> new NoSuchElementException(
                         "No settlement account found with id: " + accountId));
 
-        // A domain exception, NOT IllegalArgumentException - see the class
-        // Javadoc. Spring's exception translator rewrites the latter and would
-        // turn this 400 into a 500.
+        // A domain exception, NOT IllegalArgumentException - see the class Javadoc.
         if (!entity.getCurrencyCode().equals(newBuffer.currencyCode())) {
             throw new CurrencyMismatchException(entity.getCurrencyCode(), newBuffer.currencyCode());
         }
 
         entity.changeLiquidityBufferAmount(newBuffer.amount());
 
-        // NOTE: there is no jpaRepository.save(entity) call, and that is not an
-        // omission. Inside a transaction, entities loaded through the
-        // EntityManager are MANAGED: Hibernate holds a snapshot of their state
-        // and, at commit, compares the snapshot with the current values and
-        // issues an UPDATE for whatever changed. That is "automatic dirty
-        // checking", and it is the single most surprising thing about JPA to
-        // someone arriving from JDBC.
+        // NOTE: no jpaRepository.save(entity), and that is not an omission.
+        // Inside a transaction, entities loaded through the EntityManager are
+        // MANAGED: Hibernate snapshots them on load and, at commit, compares the
+        // snapshot with current values and issues an UPDATE for whatever changed.
+        // That is automatic dirty checking.
         //
-        // The flip side is the trap: mutate a managed entity by accident -
-        // inside a getter, in a mapping helper, anywhere - and you have silently
-        // written to the database. "Why did my read endpoint issue an UPDATE"
-        // is a genuine production mystery, and this is the answer.
+        // The trap is the same mechanism: mutate a managed entity anywhere - in a
+        // getter, in a mapping helper - and you have silently written to the
+        // database. "Why did my read endpoint issue an UPDATE" has this as its
+        // answer.
         //
         // The @Version column means this UPDATE carries "AND version = ?". If
-        // another transaction changed this row since we read it, zero rows match
-        // and Spring raises OptimisticLockingFailureException.
+        // another transaction changed the row since we read it, zero rows match
+        // and Spring raises OptimisticLockingFailureException, which the web
+        // layer turns into a 409.
         return toDomain(entity);
     }
 
-    // --- mapping ---------------------------------------------------------
+    // --- translation ------------------------------------------------------
 
-    private static List<SettlementAccount> toDomain(List<SettlementAccountEntity> entities) {
-        return entities.stream().map(JpaSettlementAccountRepositoryAdapter::toDomain).toList();
+    /**
+     * Turns our {@code PageRequest} into Spring Data's {@code Sort}.
+     *
+     * <p>{@code sortBy} is trusted here because the web layer resolved it through
+     * {@code SettlementAccountSortField}, which is an allow-list. That ordering
+     * matters: validate at the edge, and the inside stays simple. If an
+     * unvalidated string reached this line, Spring Data would throw
+     * {@code PropertyReferenceException} - a 500 whose message enumerates your
+     * entity's real property names to whoever sent the request.
+     */
+    private static Sort toSort(PageRequest pageRequest) {
+        Sort.Direction direction = pageRequest.direction() == SortDirection.DESC
+                ? Sort.Direction.DESC
+                : Sort.Direction.ASC;
+
+        Sort sort = Sort.by(direction, pageRequest.sortBy());
+
+        // A tie-break on the primary key makes the ordering TOTAL. Without it,
+        // sorting by a non-unique column (currency, say) leaves rows with equal
+        // values in an order the database is free to change between queries - so
+        // a row can appear on both page 1 and page 2, or on neither. That is a
+        // genuinely nasty, intermittent paging bug, and this one line prevents it.
+        if (!"accountId".equals(pageRequest.sortBy())) {
+            sort = sort.and(Sort.by(Sort.Direction.ASC, "accountId"));
+        }
+        return sort;
     }
 
     private static SettlementAccount toDomain(SettlementAccountEntity entity) {

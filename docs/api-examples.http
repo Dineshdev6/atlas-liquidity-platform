@@ -1,4 +1,4 @@
-### Atlas Liquidity Platform — API examples (Layer 2)
+### Atlas Liquidity Platform — API examples (Layer 3, part 1)
 #
 # Install the "REST Client" VS Code extension (humao.rest-client), then click
 # the "Send Request" link above each request.
@@ -7,31 +7,113 @@
 
 @host = http://localhost:8081
 
-### List all settlement accounts
+### --- Paging ------------------------------------------------------------
+
+### Defaults: page 0, 20 rows, ascending by accountId
 GET {{host}}/api/v1/accounts
 Accept: application/json
 
-### Filter by currency — this is now a real SQL query with an index behind it
+### First page of two — note page.totalElements is 6, page.last is false
+GET {{host}}/api/v1/accounts?page=0&size=2
+Accept: application/json
+
+### Last page
+GET {{host}}/api/v1/accounts?page=2&size=2
+Accept: application/json
+
+### Past the end — an empty page, not an error, so "loop until empty" is safe
+GET {{host}}/api/v1/accounts?page=99&size=20
+Accept: application/json
+
+### 400 — the page-size cap. One anonymous request must not be able to ask
+#   for the whole table.
+GET {{host}}/api/v1/accounts?size=999999
+Accept: application/json
+
+### 400 — negative page
+GET {{host}}/api/v1/accounts?page=-1
+Accept: application/json
+
+### 400 — Spring cannot bind "abc" to an int. This is a 400 only because
+#   GlobalExceptionHandler now extends ResponseEntityExceptionHandler.
+GET {{host}}/api/v1/accounts?page=abc
+Accept: application/json
+
+### --- Sorting -----------------------------------------------------------
+
+### Largest liquidity buffer first. JPY 500,000,000 wins on raw number —
+#   which is a reminder that sorting money across currencies is meaningless
+#   without conversion.
+GET {{host}}/api/v1/accounts?sort=liquidityBuffer&direction=desc
+Accept: application/json
+
+### Sort by a non-unique column. The adapter adds accountId as a tie-break,
+#   so paging through this can never repeat or skip a row.
+GET {{host}}/api/v1/accounts?sort=currencyCode&direction=asc&size=2
+Accept: application/json
+
+### 400 — unknown sort field. Names the valid ones; does NOT name our columns.
+#   Without the allow-list this is a 500 that leaks the entity's property names.
+GET {{host}}/api/v1/accounts?sort=password
+Accept: application/json
+
+### 400 — the column name is not the API name. The two vocabularies are
+#   deliberately independent.
+GET {{host}}/api/v1/accounts?sort=liquidityBufferAmount
+Accept: application/json
+
+### 400 — unknown direction
+GET {{host}}/api/v1/accounts?direction=sideways
+Accept: application/json
+
+### --- Filtering ---------------------------------------------------------
+
+### One filter
 GET {{host}}/api/v1/accounts?currency=USD
 Accept: application/json
 
-### Lowercase works too — normalised at the boundary
+### Lower case works — normalised at the boundary
 GET {{host}}/api/v1/accounts?currency=usd
 Accept: application/json
 
-### Filter by jurisdiction (drives data residency from Layer 11)
-GET {{host}}/api/v1/accounts?jurisdiction=EU
+### Three filters, ONE SQL query. In Layer 2 this fetched by currency and
+#   then sifted by jurisdiction in Java.
+GET {{host}}/api/v1/accounts?currency=USD&jurisdiction=US&legalEntity=ATLAS-BANK-NA
 Accept: application/json
 
-### Fetch a single account
+### A contradictory combination returns nothing — not the union of the parts
+GET {{host}}/api/v1/accounts?currency=USD&jurisdiction=EU
+Accept: application/json
+
+### Blank means absent, not "match the empty string"
+GET {{host}}/api/v1/accounts?currency=
+Accept: application/json
+
+### 400 — unknown jurisdiction, with an actionable message
+GET {{host}}/api/v1/accounts?jurisdiction=ATLANTIS
+Accept: application/json
+
+### Injection attempt — bound as a JDBC parameter, matches nothing.
+#   Turn on SQL logging and look at the statement to see why this is
+#   structurally safe rather than escaped.
+GET {{host}}/api/v1/accounts?legalEntity=x' OR '1'='1
+Accept: application/json
+
+### --- Single account ----------------------------------------------------
+
+### Fetch one
 GET {{host}}/api/v1/accounts/ACC-EU-0001
 Accept: application/json
 
-### JPY has zero minor units — note the buffer has no decimal places
+### JPY has zero minor units — the buffer has no decimal places
 GET {{host}}/api/v1/accounts/ACC-JP-0001
 Accept: application/json
 
-### --- Writes (new in Layer 2) ------------------------------------------
+### 404 — RFC 7807 problem detail
+GET {{host}}/api/v1/accounts/ACC-DOES-NOT-EXIST
+Accept: application/json
+
+### --- Writes ------------------------------------------------------------
 
 ### Set a new liquidity buffer
 PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
@@ -41,7 +123,7 @@ Content-Type: application/json
   "amount": "31000000.00"
 }
 
-### Send it again — PUT is idempotent, the result is identical
+### Send it again — PUT is idempotent, identical result
 PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
 Content-Type: application/json
 
@@ -49,7 +131,7 @@ Content-Type: application/json
   "amount": "31000000.00"
 }
 
-### Over-precise amount — Money rounds HALF_EVEN to the currency's minor units
+### Over-precise — Money rounds HALF_EVEN to the currency's minor units
 PUT {{host}}/api/v1/accounts/ACC-SG-0001/liquidity-buffer
 Content-Type: application/json
 
@@ -57,7 +139,7 @@ Content-Type: application/json
   "amount": "9000000.0050"
 }
 
-### 400 — Bean Validation rejects this at the edge, with a field-level error
+### 400 — Bean Validation, with a field-level error map
 PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
 Content-Type: application/json
 
@@ -65,54 +147,45 @@ Content-Type: application/json
   "amount": "not-a-number"
 }
 
-### 400 — missing field
-PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
-Content-Type: application/json
-
-{
-}
-
-### 400 — malformed JSON is the caller's fault, so not a 500
+### 400 — malformed JSON is the caller's fault
 PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
 Content-Type: application/json
 
 { this is not json
 
-### 404 — unknown account, as an RFC 7807 problem detail
-PUT {{host}}/api/v1/accounts/ACC-NOPE/liquidity-buffer
+### --- The Layer 3 error-contract fix ------------------------------------
+
+### 404, NOT 500. Before Layer 3 the catch-all handler turned this typo into
+#   a server error, so the 5xx alert fired for nothing.
+GET {{host}}/api/v1/nonexistent
+Accept: application/json
+
+### 405, NOT 500 — no DELETE on the collection
+DELETE {{host}}/api/v1/accounts
+Accept: application/json
+
+### 405 — no POST either (yet; part 2 adds one, with an idempotency key)
+POST {{host}}/api/v1/accounts
 Content-Type: application/json
 
-{
-  "amount": "100.00"
-}
+{}
 
-### --- Errors and operations --------------------------------------------
+### --- Operations --------------------------------------------------------
 
-### 404 on read
-GET {{host}}/api/v1/accounts/ACC-DOES-NOT-EXIST
-Accept: application/json
-
-### 400 — unknown jurisdiction, with an actionable message
-GET {{host}}/api/v1/accounts?jurisdiction=ATLANTIS
-Accept: application/json
-
-### Supply your own correlation id and watch it appear in the service log
+### Supply your own correlation id and watch it in the service log
 GET {{host}}/api/v1/accounts
 X-Correlation-Id: dinesh-manual-test-001
 Accept: application/json
 
-### Health — now includes a real database check.
-#   Try: docker compose stop postgres   and hit this again.
+### Health — includes a real database check.
+#   Try: docker compose stop postgres   then hit this again.
 GET {{host}}/actuator/health
 
-### Liveness probe (is the process alive?)
+### Liveness (is the process alive?)
 GET {{host}}/actuator/health/liveness
 
-### Readiness probe (can it actually serve traffic?)
+### Readiness (can it actually serve traffic?)
 GET {{host}}/actuator/health/readiness
 
-### Metrics — Hikari pool gauges appear here from Layer 2 onward
+### Connection pool gauges
 GET {{host}}/actuator/metrics/hikaricp.connections.active
-
-### How long the pool made callers wait for a connection
-GET {{host}}/actuator/metrics/hikaricp.connections.acquire
