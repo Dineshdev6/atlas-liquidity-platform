@@ -1,0 +1,50 @@
+# Local infrastructure for the Atlas Liquidity Platform.
+#
+# LAYER 2 TEACHING NOTE
+#
+# Why Postgres when the job description says Oracle?
+#
+# Because Oracle's licensed images are painful to obtain and enormous to run,
+# and 95% of what you need to demonstrate - schema migrations, transactions,
+# isolation levels, indexing, optimistic locking, connection pooling, the N+1
+# problem - is identical on both. ADR 0004 records this decision and lists the
+# specific places where Oracle genuinely differs, so you can speak to them.
+#
+# Two databases are created here:
+#   atlas_liquidity        the application uses this
+#   atlas_liquidity_test   the integration tests use this
+#
+# See docker/postgres-init/01-create-test-database.sql for why they are separate.
+#
+# Start it:   docker compose up -d
+# Stop it:    docker compose down
+# Wipe it:    docker compose down -v      (deletes the volume - full reset,
+#                                          and the only way to re-run the
+#                                          init scripts below)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: atlas-postgres
+    environment:
+      POSTGRES_DB: atlas_liquidity
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas
+    ports:
+      - "5432:5432"
+    volumes:
+      - atlas-pgdata:/var/lib/postgresql/data
+      # Anything in this directory runs once, when the data volume is first
+      # created. Mounted read-only because the container has no business
+      # modifying our scripts.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Kubernetes readiness probes in Layer 10 are the same idea: do not send
+      # traffic to a container until it can actually answer.
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas_liquidity"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  atlas-pgdata:

@@ -1,36 +1,31 @@
 package com.atlas.liquidity.refdata.api;
 
+import com.atlas.liquidity.common.money.Money;
 import com.atlas.liquidity.refdata.domain.Jurisdiction;
+import com.atlas.liquidity.refdata.domain.SettlementAccount;
 import com.atlas.liquidity.refdata.domain.SettlementAccountRepository;
+import jakarta.validation.Valid;
+import java.util.Currency;
 import java.util.List;
 import java.util.Locale;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * Read-only API over settlement account reference data.
+ * API over settlement account reference data.
  *
- * <p><b>Why the URI is versioned ({@code /api/v1/...}).</b> Once a downstream
- * team integrates, you cannot make a breaking change without a migration path.
- * URI versioning is the least elegant and most operationally practical of the
- * options - it is visible in logs, trivially routable at the gateway, and
- * unambiguous to a caller debugging at 2am. Be ready to compare it with header
- * and media-type versioning; the interesting answer names the trade-off rather
- * than declaring a winner.
- *
- * <p><b>Why constructor injection.</b> The dependency is {@code final}, so the
- * object cannot exist in a half-built state, and the class is trivially
- * instantiable in a unit test with a stub - no Spring context required. Field
- * injection with {@code @Autowired} gives up both of those properties. Since
- * Spring 4.3 the {@code @Autowired} annotation on a single constructor is
- * redundant, which is why you do not see it here.
- *
- * <p>Layer 3 extends this with pagination, OpenAPI documentation, and write
- * operations guarded by idempotency keys.
+ * <p><b>Look at what did not change in Layer 2.</b> The database arrived,
+ * Hibernate arrived, Flyway arrived, connection pooling arrived - and the read
+ * methods below are byte-for-byte what they were in Layer 1. That is the port
+ * and adapter arrangement paying for itself, and it is the concrete example to
+ * reach for when someone asks why you would not just call Spring Data from the
+ * controller.
  */
 @RestController
 @RequestMapping(path = "/api/v1/accounts", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -42,14 +37,6 @@ public class SettlementAccountController {
         this.repository = repository;
     }
 
-    /**
-     * Lists settlement accounts, optionally filtered.
-     *
-     * <p>Filters are optional query parameters rather than separate endpoints
-     * ({@code /accounts/by-currency/USD}) because they are attributes of the
-     * same collection resource, not different resources. Keeping one endpoint
-     * also means one place to add pagination and authorisation later.
-     */
     @GetMapping
     public List<SettlementAccountResponse> listAccounts(
             @RequestParam(required = false) String currency,
@@ -71,14 +58,6 @@ public class SettlementAccountController {
         return accounts.stream().map(SettlementAccountResponse::from).toList();
     }
 
-    /**
-     * Fetches a single account, or 404 via {@link GlobalExceptionHandler}.
-     *
-     * <p>{@code orElseThrow} rather than returning {@code ResponseEntity} with a
-     * manual status: the controller states the business outcome and lets the
-     * advice own the HTTP mapping. Consistent, and it keeps this method
-     * readable.
-     */
     @GetMapping("/{accountId}")
     public SettlementAccountResponse getAccount(@PathVariable String accountId) {
         return repository.findByAccountId(accountId)
@@ -86,13 +65,54 @@ public class SettlementAccountController {
                 .orElseThrow(() -> new AccountNotFoundException(accountId));
     }
 
+    /**
+     * Sets a new liquidity buffer on an account.
+     *
+     * <p><b>Why PUT and not PATCH or POST.</b> PUT is idempotent: sending the
+     * same request ten times leaves the resource in the same state as sending it
+     * once. That matters enormously in a payments environment, where a client
+     * that times out will retry and you have no way to know whether the first
+     * attempt landed. POST is not idempotent, so retrying it risks doing the
+     * work twice - which is why Layer 3 adds idempotency keys for the operations
+     * that genuinely must be POSTs.
+     *
+     * <p><b>{@code @Valid} is what activates Bean Validation.</b> Without it the
+     * annotations on {@code UpdateLiquidityBufferRequest} are inert decoration.
+     * A very common and very quiet bug: the constraints are right there in the
+     * code, and nothing runs them.
+     *
+     * <p><b>An honest defect, which Layer 5 fixes.</b> This method reads the
+     * account and then updates it, in two separate transactions. Between them,
+     * another request could change the account - and in the worst case, delete
+     * it. This is a read-modify-write race, and the correct fix is a single
+     * transaction spanning both operations, which means an application service
+     * owning the boundary. We do not add one yet because there is nothing else
+     * for it to orchestrate. Being able to point at this and say "I know, here
+     * is the race, here is the fix, here is why I deferred it" is worth more in
+     * a code review than code with no known flaws.
+     */
+    @PutMapping(path = "/{accountId}/liquidity-buffer",
+                consumes = MediaType.APPLICATION_JSON_VALUE)
+    public SettlementAccountResponse updateLiquidityBuffer(
+            @PathVariable String accountId,
+            @Valid @RequestBody UpdateLiquidityBufferRequest request) {
+
+        SettlementAccount existing = repository.findByAccountId(accountId)
+                .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        // The currency comes from the account, never from the caller. The
+        // client cannot express a mismatched buffer, so we never have to
+        // validate for one here.
+        Currency currency = Currency.getInstance(existing.currencyCode());
+        Money newBuffer = Money.of(currency, new java.math.BigDecimal(request.amount()));
+
+        return SettlementAccountResponse.from(repository.updateLiquidityBuffer(accountId, newBuffer));
+    }
+
     private Jurisdiction parseJurisdiction(String value) {
         try {
             return Jurisdiction.valueOf(value.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
-            // Rethrown with a message a caller can act on, rather than
-            // "No enum constant com.atlas...". Small thing; big difference to
-            // whoever is integrating against you.
             throw new IllegalArgumentException(
                     "Unknown jurisdiction '" + value + "'. Valid values: "
                             + java.util.Arrays.toString(Jurisdiction.values()), e);

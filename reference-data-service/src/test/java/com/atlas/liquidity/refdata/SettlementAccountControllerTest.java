@@ -1,11 +1,15 @@
 package com.atlas.liquidity.refdata;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.atlas.liquidity.common.money.Money;
 import com.atlas.liquidity.common.web.CorrelationIdFilter;
 import com.atlas.liquidity.refdata.api.SettlementAccountController;
 import com.atlas.liquidity.refdata.config.WebConfig;
@@ -19,45 +23,37 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
- * Web-layer slice test.
+ * Web-layer slice test. No database, no Docker, runs in about a second.
  *
- * <p><b>Why {@code @WebMvcTest} and not {@code @SpringBootTest}.</b> A slice
- * test starts only the MVC infrastructure - controllers, converters,
- * {@code @ControllerAdvice}, filters - and leaves out repositories, datasources
- * and messaging. It boots in a fraction of the time, and when it fails you know
- * the failure is in the web layer. A suite made entirely of full-context tests
- * is the single most common cause of a slow build, and a slow build is what
- * kills a team's appetite for testing.
- *
- * <p>{@code @MockitoBean} (Spring Boot 3.4+, replacing the deprecated
- * {@code @MockBean}) puts a Mockito mock into the test's application context in
- * place of the real repository. The controller is therefore tested against a
- * contract we control, not against seed data that might change.
- *
- * <p>{@code @Import(WebConfig.class)} is needed because slice tests do not pick
- * up arbitrary {@code @Configuration} classes - only those relevant to the
- * slice. Without it the correlation-ID filter is absent and the last test here
- * fails. That is a genuinely useful thing to have hit once.
+ * <p>This is the fast loop, and it stays fast precisely because the repository
+ * is mocked. The real persistence behaviour is proved once, slowly, in
+ * {@code SettlementAccountPersistenceIT}. Duplicating it here would double the
+ * runtime and buy nothing.
  */
 @WebMvcTest(SettlementAccountController.class)
 @Import(WebConfig.class)
 class SettlementAccountControllerTest {
 
     private static final SettlementAccount US_ACCOUNT = new SettlementAccount(
-            "ACC-US-0001", "8801234567", "ATLAS-BANK-NA", "USD", Jurisdiction.US, "ATLBUS33XXX");
+            "ACC-US-0001", "8801234567", "ATLAS-BANK-NA", "USD", Jurisdiction.US, "ATLBUS33XXX",
+            Money.of("USD", "25000000.00"));
 
     private static final SettlementAccount EU_ACCOUNT = new SettlementAccount(
-            "ACC-EU-0001", "DE89370400440532013000", "ATLAS-BANK-EU", "EUR", Jurisdiction.EU, "ATLBDEFFXXX");
+            "ACC-EU-0001", "DE89370400440532013000", "ATLAS-BANK-EU", "EUR", Jurisdiction.EU, "ATLBDEFFXXX",
+            Money.of("EUR", "18000000.00"));
 
     @Autowired
     private MockMvc mockMvc;
 
     @MockitoBean
     private SettlementAccountRepository repository;
+
+    // --- reads -----------------------------------------------------------
 
     @Test
     @DisplayName("GET /api/v1/accounts returns all accounts")
@@ -69,6 +65,20 @@ class SettlementAccountControllerTest {
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[0].accountId").value("ACC-US-0001"))
                 .andExpect(jsonPath("$[0].currencyCode").value("USD"));
+    }
+
+    @Test
+    @DisplayName("serialises the liquidity buffer as a string, not a JSON number")
+    void serialisesMoneyAsString() throws Exception {
+        given(repository.findAll()).willReturn(List.of(US_ACCOUNT));
+
+        mockMvc.perform(get("/api/v1/accounts"))
+                .andExpect(status().isOk())
+                // jsonPath's isString() is the assertion that matters here. A
+                // JSON number would be parsed as a double by every JavaScript
+                // client and would silently lose precision on large values.
+                .andExpect(jsonPath("$[0].liquidityBuffer").isString())
+                .andExpect(jsonPath("$[0].liquidityBuffer").value("25000000.00"));
     }
 
     @Test
@@ -139,5 +149,68 @@ class SettlementAccountControllerTest {
         mockMvc.perform(get("/api/v1/accounts"))
                 .andExpect(status().isOk())
                 .andExpect(header().exists(CorrelationIdFilter.HEADER));
+    }
+
+    // --- writes (Layer 2) ------------------------------------------------
+
+    @Test
+    @DisplayName("PUT sets a new liquidity buffer")
+    void updatesLiquidityBuffer() throws Exception {
+        SettlementAccount updated = US_ACCOUNT.withLiquidityBuffer(Money.of("USD", "31000000.00"));
+
+        given(repository.findByAccountId("ACC-US-0001")).willReturn(Optional.of(US_ACCOUNT));
+        given(repository.updateLiquidityBuffer(eq("ACC-US-0001"), any(Money.class))).willReturn(updated);
+
+        mockMvc.perform(put("/api/v1/accounts/ACC-US-0001/liquidity-buffer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"amount\":\"31000000.00\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.liquidityBuffer").value("31000000.00"));
+    }
+
+    @Test
+    @DisplayName("PUT to an unknown account is a 404, and never reaches the update")
+    void updateOnUnknownAccountIsNotFound() throws Exception {
+        given(repository.findByAccountId("ACC-NOPE")).willReturn(Optional.empty());
+
+        mockMvc.perform(put("/api/v1/accounts/ACC-NOPE/liquidity-buffer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"amount\":\"100.00\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.accountId").value("ACC-NOPE"));
+    }
+
+    @Test
+    @DisplayName("a non-numeric amount is rejected by Bean Validation before any logic runs")
+    void rejectsNonNumericAmount() throws Exception {
+        mockMvc.perform(put("/api/v1/accounts/ACC-US-0001/liquidity-buffer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"amount\":\"not-a-number\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.title").value("Validation failed"))
+                .andExpect(jsonPath("$.errors.amount").exists());
+
+        // The repository was never touched - validation ran at the edge.
+        org.mockito.Mockito.verifyNoInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("a missing amount is rejected")
+    void rejectsMissingAmount() throws Exception {
+        mockMvc.perform(put("/api/v1/accounts/ACC-US-0001/liquidity-buffer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.title").value("Validation failed"));
+    }
+
+    @Test
+    @DisplayName("a malformed JSON body is a 400, not a 500")
+    void rejectsMalformedJson() throws Exception {
+        mockMvc.perform(put("/api/v1/accounts/ACC-US-0001/liquidity-buffer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{ this is not json"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.title").value("Malformed request body"));
     }
 }

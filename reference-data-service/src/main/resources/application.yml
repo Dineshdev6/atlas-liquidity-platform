@@ -1,35 +1,91 @@
 spring:
   application:
-    # Shows up in logs, metrics and (from Layer 4) Kafka client IDs.
-    # Set it now and every downstream tool labels this service correctly.
     name: reference-data-service
   lifecycle:
-    # Graceful shutdown is half the story; this is the other half. Kubernetes
-    # sends SIGTERM and waits. Without a grace period the JVM exits mid-request
-    # and a caller sees a connection reset during every rolling deploy.
-    # Layer 10 pairs this with a preStop hook.
     timeout-per-shutdown-phase: 25s
+
+  # ---------------------------------------------------------------------------
+  # LAYER 2: datasource
+  # ---------------------------------------------------------------------------
+  datasource:
+    url: jdbc:postgresql://localhost:5432/atlas_liquidity
+    username: atlas
+    password: atlas
+    hikari:
+      # HikariCP is Spring Boot's default pool. These numbers are deliberately
+      # small, and the reasoning matters more than the values.
+      #
+      # A connection pool is a QUEUE, not a cache. Every pooled connection is a
+      # backend process on the database server holding memory. Postgres starts
+      # to degrade well before a thousand connections, so 20 services each
+      # opening 50 connections will take the database down long before it takes
+      # the services down.
+      #
+      # The counter-intuitive rule: a SMALLER pool is usually FASTER. If the
+      # database can genuinely do 10 things at once, a pool of 100 does not make
+      # it do 100 - it makes 100 queries contend, and every one of them gets
+      # slower. Layer 7 measures this properly with JMeter.
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 3000      # fail fast rather than pile up waiters
+      idle-timeout: 600000
+      max-lifetime: 1800000         # recycle before any network/DB idle killer does
+      pool-name: atlas-refdata-pool
+
+  jpa:
+    hibernate:
+      # NEVER "update" or "create-drop" outside a throwaway demo. Letting
+      # Hibernate mutate a production schema is how you lose a column.
+      # "validate" makes Hibernate check its mapping against the real schema at
+      # startup and refuse to boot on a mismatch - so a forgotten migration
+      # fails loudly on deploy instead of quietly at 3am. Flyway owns the
+      # schema; Hibernate only reads it. See ADR 0003.
+      ddl-auto: validate
+    # open-in-view leaves the Hibernate session open for the whole HTTP request,
+    # so lazy collections can be loaded from inside the view layer. It is on by
+    # default and it is a trap: it hides N+1 queries, holds a pooled connection
+    # for the entire request including time spent serialising JSON, and makes
+    # transaction boundaries meaningless. Turn it off, deliberately, every time.
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Fail rather than guess if the schema history looks wrong.
+    baseline-on-migrate: false
+    validate-on-migrate: true
 
 server:
   port: 8081
-  shutdown: graceful          # finish in-flight requests before dying
+  shutdown: graceful
   error:
-    include-stacktrace: never # never leak internals to a caller
+    include-stacktrace: never
 
 management:
   endpoints:
     web:
       exposure:
-        # Deliberately narrow. Exposing "*" is convenient locally and a finding
-        # in a security review - /env and /heapdump disclose secrets.
         include: health,info,metrics,prometheus
   endpoint:
     health:
-      # Kubernetes probes hit /actuator/health/liveness and /readiness.
-      # Layer 10 wires them up; enabling the groups now costs nothing.
       probes:
         enabled: true
       show-details: when-authorized
+  # The health endpoint now reports the database too. In Layer 10 that becomes
+  # meaningful: readiness fails when Postgres is unreachable, so Kubernetes
+  # stops routing traffic to a pod that cannot serve it, rather than letting it
+  # return 500s to users.
+  health:
+    db:
+      enabled: true
   info:
     env:
       enabled: true
@@ -37,12 +93,15 @@ management:
 info:
   app:
     name: Reference Data Service
-    layer: "1 - monorepo skeleton"
+    layer: "2 - domain model and persistence"
 
 logging:
   pattern:
-    # [%X{correlationId}] pulls the value CorrelationIdFilter put in the MDC.
-    # This single line is what makes a request traceable across services.
     console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"
   level:
     com.atlas.liquidity: DEBUG
+    # Uncomment these two to see every SQL statement Hibernate issues, with
+    # bound parameters. This is how you SEE the N+1 problem rather than reading
+    # about it - do it once, deliberately, in Layer 2's exercises.
+    # org.hibernate.SQL: DEBUG
+    # org.hibernate.orm.jdbc.bind: TRACE

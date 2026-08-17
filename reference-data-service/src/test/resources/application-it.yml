@@ -1,0 +1,46 @@
+# Integration-test configuration. Active only under the "it" profile, which
+# AbstractPostgresIntegrationTest switches on.
+#
+# HOW SPRING RESOLVES THIS
+# Spring loads application.yml first (from the main module, on the test
+# classpath), then layers application-<profile>.yml over it. Only the keys below
+# are overridden; everything else - Hikari sizing, ddl-auto: validate,
+# open-in-view: false, the logging pattern - is inherited from the main config.
+# That matters: the tests exercise the SAME settings the application runs with,
+# apart from which database they point at.
+
+spring:
+  datasource:
+    # Same Postgres instance as the application, different database.
+    url: jdbc:postgresql://localhost:5432/atlas_liquidity_test
+    username: atlas
+    password: atlas
+    hikari:
+      # A test JVM needs far fewer connections than a running service, and a
+      # small pool makes connection-leak bugs surface fast rather than hiding
+      # until production.
+      maximum-pool-size: 5
+      pool-name: atlas-it-pool
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Deliberately NOT clean-on-start. Flyway's clean is disabled by default
+    # since Flyway 9 precisely because someone, somewhere, pointed it at
+    # production. We rely on the tests restoring what they change instead.
+
+  jpa:
+    # Left at validate, same as production. If a migration and an entity drift
+    # apart, the integration tests fail to start - which is exactly when you
+    # want to find out.
+    hibernate:
+      ddl-auto: validate
+
+logging:
+  level:
+    # Uncomment to watch the SQL the tests generate. Doing this once, and
+    # counting the queries, is how the N+1 problem stops being an abstraction.
+    # org.hibernate.SQL: DEBUG
+    # org.hibernate.orm.jdbc.bind: TRACE
+    org.flywaydb: INFO
+    com.zaxxer.hikari: INFO

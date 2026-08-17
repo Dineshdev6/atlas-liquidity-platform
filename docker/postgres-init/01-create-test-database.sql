@@ -1,0 +1,21 @@
+-- Creates a SEPARATE database for integration tests, in the same Postgres
+-- instance the application uses for development.
+--
+-- WHY A SEPARATE DATABASE MATTERS
+-- Tests mutate data. If they share the development database, then every time
+-- you run the suite it changes the rows you were looking at in psql, and every
+-- time you experiment in psql you break the suite. Worse, the failures are
+-- intermittent and depend on what you did last - the most expensive kind of
+-- bug to chase.
+--
+-- Same engine, same version, same SQL dialect, same Flyway migrations - just a
+-- different database name. That is the property we actually needed from
+-- Testcontainers; the throwaway-per-run part is a bonus we are living without
+-- for now.
+--
+-- Scripts in /docker-entrypoint-initdb.d run ONLY when the data volume is
+-- created for the first time. If you already have a volume, recreate it:
+--     docker compose down -v
+--     docker compose up -d
+
+CREATE DATABASE atlas_liquidity_test OWNER atlas;
