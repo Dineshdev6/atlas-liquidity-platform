@@ -1,12 +1,9 @@
-### Atlas Liquidity Platform — Layer 1 API examples
+### Atlas Liquidity Platform — API examples (Layer 2)
 #
 # Install the "REST Client" VS Code extension (humao.rest-client), then click
-# the "Send Request" link that appears above each request.
+# the "Send Request" link above each request.
 #
-# Why this file is checked into the repo rather than living in Postman:
-# it is versioned with the code, it reviews in a pull request, and a new
-# engineer can exercise the API within a minute of cloning. Postman
-# collections drift; this does not.
+# Requires Postgres:  docker compose up -d
 
 @host = http://localhost:8081
 
@@ -14,8 +11,12 @@
 GET {{host}}/api/v1/accounts
 Accept: application/json
 
-### Filter by currency
+### Filter by currency — this is now a real SQL query with an index behind it
 GET {{host}}/api/v1/accounts?currency=USD
+Accept: application/json
+
+### Lowercase works too — normalised at the boundary
+GET {{host}}/api/v1/accounts?currency=usd
 Accept: application/json
 
 ### Filter by jurisdiction (drives data residency from Layer 11)
@@ -26,7 +27,68 @@ Accept: application/json
 GET {{host}}/api/v1/accounts/ACC-EU-0001
 Accept: application/json
 
-### 404 — returns an RFC 7807 problem detail, not an HTML error page
+### JPY has zero minor units — note the buffer has no decimal places
+GET {{host}}/api/v1/accounts/ACC-JP-0001
+Accept: application/json
+
+### --- Writes (new in Layer 2) ------------------------------------------
+
+### Set a new liquidity buffer
+PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
+Content-Type: application/json
+
+{
+  "amount": "31000000.00"
+}
+
+### Send it again — PUT is idempotent, the result is identical
+PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
+Content-Type: application/json
+
+{
+  "amount": "31000000.00"
+}
+
+### Over-precise amount — Money rounds HALF_EVEN to the currency's minor units
+PUT {{host}}/api/v1/accounts/ACC-SG-0001/liquidity-buffer
+Content-Type: application/json
+
+{
+  "amount": "9000000.0050"
+}
+
+### 400 — Bean Validation rejects this at the edge, with a field-level error
+PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
+Content-Type: application/json
+
+{
+  "amount": "not-a-number"
+}
+
+### 400 — missing field
+PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
+Content-Type: application/json
+
+{
+}
+
+### 400 — malformed JSON is the caller's fault, so not a 500
+PUT {{host}}/api/v1/accounts/ACC-US-0001/liquidity-buffer
+Content-Type: application/json
+
+{ this is not json
+
+### 404 — unknown account, as an RFC 7807 problem detail
+PUT {{host}}/api/v1/accounts/ACC-NOPE/liquidity-buffer
+Content-Type: application/json
+
+{
+  "amount": "100.00"
+}
+
+### --- Errors and operations --------------------------------------------
+
+### 404 on read
 GET {{host}}/api/v1/accounts/ACC-DOES-NOT-EXIST
 Accept: application/json
 
@@ -34,23 +96,23 @@ Accept: application/json
 GET {{host}}/api/v1/accounts?jurisdiction=ATLANTIS
 Accept: application/json
 
-### Supply your own correlation id — check it comes back in the response header
-#   and appears in the service's console log for this request
+### Supply your own correlation id and watch it appear in the service log
 GET {{host}}/api/v1/accounts
 X-Correlation-Id: dinesh-manual-test-001
 Accept: application/json
 
-### Health — this is the endpoint Kubernetes probes in Layer 10
+### Health — now includes a real database check.
+#   Try: docker compose stop postgres   and hit this again.
 GET {{host}}/actuator/health
 
-### Liveness probe
+### Liveness probe (is the process alive?)
 GET {{host}}/actuator/health/liveness
 
-### Readiness probe
+### Readiness probe (can it actually serve traffic?)
 GET {{host}}/actuator/health/readiness
 
-### Build and app info
-GET {{host}}/actuator/info
+### Metrics — Hikari pool gauges appear here from Layer 2 onward
+GET {{host}}/actuator/metrics/hikaricp.connections.active
 
-### Metrics index (Prometheus scrapes /actuator/prometheus from Layer 10)
-GET {{host}}/actuator/metrics
+### How long the pool made callers wait for a connection
+GET {{host}}/actuator/metrics/hikaricp.connections.acquire
