@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.atlas.liquidity</groupId>
+        <artifactId>atlas-liquidity-platform</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>liquidity-common</artifactId>
+    <name>Liquidity Common</name>
+    <description>Shared domain primitives, error model and cross-cutting web concerns</description>
+
+    <!--
+      TEACHING NOTE
+      This module is a plain library, NOT a Spring Boot application.
+      It has no main class and no spring-boot-maven-plugin, so it produces a
+      normal thin JAR that other modules can depend on. If you accidentally add
+      the boot plugin here, it repackages the jar into an executable fat jar and
+      downstream modules can no longer see its classes - a classic and very
+      confusing multi-module mistake.
+    -->
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- provided: the servlet container supplies this at runtime -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

@@ -1,0 +1,48 @@
+spring:
+  application:
+    # Shows up in logs, metrics and (from Layer 4) Kafka client IDs.
+    # Set it now and every downstream tool labels this service correctly.
+    name: reference-data-service
+  lifecycle:
+    # Graceful shutdown is half the story; this is the other half. Kubernetes
+    # sends SIGTERM and waits. Without a grace period the JVM exits mid-request
+    # and a caller sees a connection reset during every rolling deploy.
+    # Layer 10 pairs this with a preStop hook.
+    timeout-per-shutdown-phase: 25s
+
+server:
+  port: 8081
+  shutdown: graceful          # finish in-flight requests before dying
+  error:
+    include-stacktrace: never # never leak internals to a caller
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Deliberately narrow. Exposing "*" is convenient locally and a finding
+        # in a security review - /env and /heapdump disclose secrets.
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      # Kubernetes probes hit /actuator/health/liveness and /readiness.
+      # Layer 10 wires them up; enabling the groups now costs nothing.
+      probes:
+        enabled: true
+      show-details: when-authorized
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: Reference Data Service
+    layer: "1 - monorepo skeleton"
+
+logging:
+  pattern:
+    # [%X{correlationId}] pulls the value CorrelationIdFilter put in the MDC.
+    # This single line is what makes a request traceable across services.
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"
+  level:
+    com.atlas.liquidity: DEBUG

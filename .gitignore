@@ -1,0 +1,43 @@
+# Build output
+target/
+build/
+out/
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.classpath
+.project
+.settings/
+.factorypath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Node (from Layer 9)
+node_modules/
+dist/
+.vite/
+
+# Secrets - never commit these. Layer 8 covers how to do this properly.
+*.pem
+*.key
+*.p12
+*.jks
+.env
+.env.local
+application-local.yml
+application-secrets.yml

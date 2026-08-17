@@ -1,0 +1,56 @@
+### Atlas Liquidity Platform — Layer 1 API examples
+#
+# Install the "REST Client" VS Code extension (humao.rest-client), then click
+# the "Send Request" link that appears above each request.
+#
+# Why this file is checked into the repo rather than living in Postman:
+# it is versioned with the code, it reviews in a pull request, and a new
+# engineer can exercise the API within a minute of cloning. Postman
+# collections drift; this does not.
+
+@host = http://localhost:8081
+
+### List all settlement accounts
+GET {{host}}/api/v1/accounts
+Accept: application/json
+
+### Filter by currency
+GET {{host}}/api/v1/accounts?currency=USD
+Accept: application/json
+
+### Filter by jurisdiction (drives data residency from Layer 11)
+GET {{host}}/api/v1/accounts?jurisdiction=EU
+Accept: application/json
+
+### Fetch a single account
+GET {{host}}/api/v1/accounts/ACC-EU-0001
+Accept: application/json
+
+### 404 — returns an RFC 7807 problem detail, not an HTML error page
+GET {{host}}/api/v1/accounts/ACC-DOES-NOT-EXIST
+Accept: application/json
+
+### 400 — unknown jurisdiction, with an actionable message
+GET {{host}}/api/v1/accounts?jurisdiction=ATLANTIS
+Accept: application/json
+
+### Supply your own correlation id — check it comes back in the response header
+#   and appears in the service's console log for this request
+GET {{host}}/api/v1/accounts
+X-Correlation-Id: dinesh-manual-test-001
+Accept: application/json
+
+### Health — this is the endpoint Kubernetes probes in Layer 10
+GET {{host}}/actuator/health
+
+### Liveness probe
+GET {{host}}/actuator/health/liveness
+
+### Readiness probe
+GET {{host}}/actuator/health/readiness
+
+### Build and app info
+GET {{host}}/actuator/info
+
+### Metrics index (Prometheus scrapes /actuator/prometheus from Layer 10)
+GET {{host}}/actuator/metrics
