@@ -1,6 +1,7 @@
 package com.atlas.liquidity.refdata.api;
 
 import com.atlas.liquidity.common.money.CurrencyMismatchException;
+import com.atlas.liquidity.refdata.idempotency.IdempotencyExceptions;
 import java.net.URI;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -162,6 +163,61 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         problem.setType(URI.create(PROBLEM_BASE + "currency-mismatch"));
         problem.setProperty("expectedCurrency", ex.left());
         problem.setProperty("providedCurrency", ex.right());
+        problem.setProperty("timestamp", Instant.now());
+        return problem;
+    }
+
+    /**
+     * An idempotency key was reused for a <em>different</em> request.
+     *
+     * <p><b>422 Unprocessable Content, not 400.</b> The request is syntactically
+     * perfect - well-formed JSON, a valid amount, a valid key. It is
+     * <em>semantically</em> impossible, because that key already means something
+     * else. Drawing that line is what 422 exists for.
+     *
+     * <p>And it must be an error rather than a silent replay. If we honoured the
+     * key, a client that sent "+5,000,000" under key K and later "+50,000,000"
+     * under the same K by mistake would get the first response, see success, and
+     * believe fifty million had been applied. The money would be right and the
+     * client's picture of reality would be wrong - which is worse, because nothing
+     * would ever correct it.
+     */
+    @ExceptionHandler(IdempotencyExceptions.KeyReuseException.class)
+    public ProblemDetail handleIdempotencyKeyReuse(IdempotencyExceptions.KeyReuseException ex) {
+        log.warn("Idempotency key reused with a different payload: {}", ex.idempotencyKey());
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+        problem.setTitle("Idempotency key reused");
+        problem.setType(URI.create(PROBLEM_BASE + "idempotency-key-reused"));
+        problem.setProperty("idempotencyKey", ex.idempotencyKey());
+        problem.setProperty("timestamp", Instant.now());
+        return problem;
+    }
+
+    /**
+     * A request with this idempotency key is already being processed.
+     *
+     * <p><b>409 Conflict, and the client should just retry.</b> Two concurrent
+     * requests with the same key both try to insert the same primary key; the
+     * database lets exactly one through. The loser rolls back - including any work
+     * it had already done, which is the point - and lands here. On retry the winner
+     * has committed, so the loser finds the completed record and receives the
+     * original response. End state: applied once, reported consistently to both.
+     *
+     * <p>{@code Retry-After} is set because a machine client should be told how long
+     * to wait rather than hammering us. A 409 with no guidance invites a tight retry
+     * loop, which turns a one-second race into a self-inflicted outage.
+     */
+    @ExceptionHandler(IdempotencyExceptions.KeyInFlightException.class)
+    public ProblemDetail handleIdempotencyKeyInFlight(IdempotencyExceptions.KeyInFlightException ex) {
+        log.info("Concurrent request for idempotency key {}", ex.idempotencyKey());
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        problem.setTitle("Request already in progress");
+        problem.setType(URI.create(PROBLEM_BASE + "idempotency-key-in-flight"));
+        problem.setProperty("idempotencyKey", ex.idempotencyKey());
+        problem.setProperty("retryAfterSeconds", 1);
         problem.setProperty("timestamp", Instant.now());
         return problem;
     }

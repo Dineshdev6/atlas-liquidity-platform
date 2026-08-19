@@ -4,21 +4,30 @@ import com.atlas.liquidity.common.money.Money;
 import com.atlas.liquidity.common.query.Page;
 import com.atlas.liquidity.common.query.PageRequest;
 import com.atlas.liquidity.common.query.SortDirection;
+import com.atlas.liquidity.refdata.application.LiquidityBufferAdjustmentService;
 import com.atlas.liquidity.refdata.domain.Jurisdiction;
 import com.atlas.liquidity.refdata.domain.SettlementAccount;
 import com.atlas.liquidity.refdata.domain.SettlementAccountQuery;
 import com.atlas.liquidity.refdata.domain.SettlementAccountRepository;
 import com.atlas.liquidity.refdata.domain.SettlementAccountSortField;
+import com.atlas.liquidity.refdata.idempotency.IdempotencyService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.Currency;
 import java.util.Locale;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -26,139 +35,203 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * API over settlement account reference data.
  *
- * <p><b>Why the URI carries the version ({@code /api/v1/...}).</b> Once a
- * downstream team integrates, you cannot make a breaking change without a
- * migration path. The three options are URI versioning, a custom header
- * ({@code X-API-Version: 2}), and media-type versioning
- * ({@code Accept: application/vnd.atlas.v2+json}). Purists prefer the latter two
- * because the URI should identify a resource, not a representation of it - and
- * they are right in theory.
- *
- * <p>In an operational bank, URI versioning wins for unglamorous reasons: it is
- * visible in access logs and traces, trivially routable at a gateway (send
- * {@code /v1} to the old cluster, {@code /v2} to the new), and unambiguous to
- * someone debugging at 2am with a curl command. Header versioning is invisible in
- * a log line and easy to forget; media-type versioning breaks the "paste the URL
- * in a browser" workflow that every support engineer uses. Be ready to compare
- * all three - the interesting answer names the trade-off rather than declaring a
- * winner.
+ * <p><b>Why the URI carries the version.</b> Once a downstream team integrates you
+ * cannot make a breaking change without a migration path. The alternatives are a
+ * custom header ({@code X-API-Version: 2}) and media-type versioning
+ * ({@code Accept: application/vnd.atlas.v2+json}); purists prefer both, because a
+ * URI should identify a resource rather than a representation of it, and in theory
+ * they are right. In an operational bank URI versioning wins for unglamorous
+ * reasons: it is visible in access logs and traces, trivially routable at a gateway,
+ * and unambiguous to someone debugging at 2am with curl. Header versioning is
+ * invisible in a log line; media-type versioning breaks pasting a URL into a
+ * browser. Name the trade-off rather than declaring a winner.
  */
 @RestController
 @RequestMapping(path = "/api/v1/accounts", produces = MediaType.APPLICATION_JSON_VALUE)
+@Tag(name = "Settlement accounts",
+     description = "Nostro and settlement accounts, and their intraday liquidity buffers")
 public class SettlementAccountController {
 
-    private final SettlementAccountRepository repository;
+    private static final String OPERATION_ADJUST_BUFFER = "adjust-liquidity-buffer";
 
-    public SettlementAccountController(SettlementAccountRepository repository) {
+    private final SettlementAccountRepository repository;
+    private final LiquidityBufferAdjustmentService adjustmentService;
+    private final IdempotencyService idempotencyService;
+
+    public SettlementAccountController(
+            SettlementAccountRepository repository,
+            LiquidityBufferAdjustmentService adjustmentService,
+            IdempotencyService idempotencyService) {
         this.repository = repository;
+        this.adjustmentService = adjustmentService;
+        this.idempotencyService = idempotencyService;
     }
 
     /**
      * Lists settlement accounts, filtered, sorted and paged.
      *
-     * <p><b>This method is where Layer 2's two-pass filtering defect died.</b> It
-     * used to fetch by currency and then filter by jurisdiction in Java. Now the
-     * criteria go to the database as one query and the result comes back already
-     * paged.
-     *
-     * <p><b>Everything a caller sends is parsed and validated here, at the edge,
-     * before anything else runs.</b> That ordering is the whole point of a
-     * boundary: {@code page}, {@code size}, {@code sort} and {@code direction} are
-     * checked against an allow-list or a numeric range, so the layers behind this
-     * one can trust their inputs and stay simple. An unvalidated {@code sort}
-     * reaching Spring Data produces a 500 whose message lists your entity's real
-     * property names to whoever sent the request.
-     *
-     * <p>Defaults are deliberate: page 0, 20 rows, ascending by {@code accountId}.
-     * A caller who supplies nothing gets a sane, bounded, deterministically
-     * ordered response rather than the entire table.
-     *
-     * @param currency    optional ISO-4217 filter, case-insensitive
-     * @param jurisdiction optional jurisdiction filter, case-insensitive
-     * @param legalEntity optional exact-match filter on the owning entity
-     * @param page        zero-based page index
-     * @param size        rows per page, capped at {@link PageRequest#MAX_SIZE}
-     * @param sort        one of the fields in {@link SettlementAccountSortField}
-     * @param direction   {@code asc} or {@code desc}
+     * <p>Everything the caller sends is parsed and validated here, at the edge,
+     * before anything else runs. An unvalidated {@code sort} reaching Spring Data
+     * produces a 500 whose message lists the entity's real property names to
+     * whoever sent the request.
      */
     @GetMapping
+    @Operation(summary = "List settlement accounts",
+               description = """
+                       Returns a page of accounts. All filters are optional and combine into a
+                       single query. Page size is capped at 200; `sort` accepts only the
+                       documented field names.
+                       """)
+    @ApiResponse(responseCode = "200", description = "A page of accounts")
+    @ApiResponse(responseCode = "400", description = "Invalid page, size, sort, direction or filter value")
     public PageResponse<SettlementAccountResponse> listAccounts(
+            @Parameter(description = "ISO-4217 code, case-insensitive", example = "USD")
             @RequestParam(required = false) String currency,
+
+            @Parameter(description = "Regulatory jurisdiction, case-insensitive", example = "US")
             @RequestParam(required = false) String jurisdiction,
+
+            @Parameter(description = "Owning legal entity, exact match", example = "ATLAS-BANK-NA")
             @RequestParam(required = false) String legalEntity,
+
+            @Parameter(description = "Zero-based page index", example = "0")
             @RequestParam(defaultValue = "0") int page,
+
+            @Parameter(description = "Rows per page, maximum 200", example = "20")
             @RequestParam(defaultValue = "20") int size,
+
+            @Parameter(description = "accountId, accountNumber, legalEntity, currencyCode, "
+                    + "jurisdiction or liquidityBuffer", example = "accountId")
             @RequestParam(defaultValue = "accountId") String sort,
+
+            @Parameter(description = "asc or desc", example = "asc")
             @RequestParam(defaultValue = "asc") String direction) {
 
-        SettlementAccountQuery query = new SettlementAccountQuery(
-                currency,
-                parseJurisdiction(jurisdiction),
-                legalEntity);
+        SettlementAccountQuery query =
+                new SettlementAccountQuery(currency, parseJurisdiction(jurisdiction), legalEntity);
 
-        // Allow-list resolution. An unknown field is a 400 naming the valid ones,
-        // not a 500 disclosing our schema.
         SettlementAccountSortField sortField = SettlementAccountSortField.parse(sort);
 
-        // PageRequest's own constructor enforces page >= 0 and 1 <= size <= 200,
-        // throwing IllegalArgumentException, which the advice turns into a 400.
-        // The validation lives with the type rather than being repeated by every
-        // caller - which is the same reason Money owns its own scale.
         PageRequest pageRequest = PageRequest.of(
                 page, size, sortField.entityProperty(), SortDirection.parse(direction));
 
         Page<SettlementAccount> result = repository.search(query, pageRequest);
 
-        // Page.map keeps the paging metadata untouched while converting the
-        // content, so the counts cannot drift out of step with the rows.
+        // Page.map keeps the paging metadata untouched while converting the content,
+        // so the counts cannot drift out of step with the rows.
         return PageResponse.from(result.map(SettlementAccountResponse::from));
     }
 
     @GetMapping("/{accountId}")
-    public SettlementAccountResponse getAccount(@PathVariable String accountId) {
+    @Operation(summary = "Fetch one settlement account")
+    @ApiResponse(responseCode = "200", description = "The account")
+    @ApiResponse(responseCode = "404", description = "No such account")
+    public SettlementAccountResponse getAccount(
+            @Parameter(description = "Internal account identifier", example = "ACC-US-0001")
+            @PathVariable String accountId) {
+
         return repository.findByAccountId(accountId)
                 .map(SettlementAccountResponse::from)
                 .orElseThrow(() -> new AccountNotFoundException(accountId));
     }
 
     /**
-     * Sets a new liquidity buffer on an account.
+     * Sets the buffer to an absolute value.
      *
-     * <p><b>Why PUT and not PATCH or POST.</b> PUT is idempotent: sending the same
-     * request ten times leaves the resource exactly as one request would. That
-     * matters enormously in a payments environment, where a client whose call
-     * times out has no way to know whether the work happened, and will retry.
-     * POST is not idempotent, so retrying it risks doing the work twice - which is
-     * why the next slice of Layer 3 adds idempotency keys for the operations that
-     * genuinely must be POSTs.
+     * <p><b>PUT, and therefore no idempotency key.</b> "Make it exactly this" is
+     * naturally idempotent: send it ten times and the state is the same as sending
+     * it once. A client whose call times out can simply retry. Compare the POST
+     * below, which cannot.
      *
-     * <p><b>{@code @Valid} is what activates Bean Validation.</b> Without it the
-     * constraints on {@code UpdateLiquidityBufferRequest} are inert decoration - a
-     * very common and very quiet bug.
-     *
-     * <p><b>A known defect, still here, fixed in Layer 5.</b> This reads the
-     * account and then updates it in two separate transactions. Between them
-     * another request could change or delete it. The correct fix is one
-     * transaction spanning both, owned by an application service - deferred until
-     * there is something else for that service to orchestrate. Being able to point
-     * at a race and explain why you deferred the fix beats code with no known
-     * flaws.
+     * <p><b>A known defect, still here.</b> This reads the account and then updates
+     * it in two separate transactions, so another request could change or delete it
+     * in between. The adjustment endpoint below does not have this problem, because
+     * it goes through an application service that owns one transaction. Moving this
+     * method onto the same service is a small change and a good exercise.
      */
-    @PutMapping(path = "/{accountId}/liquidity-buffer",
-                consumes = MediaType.APPLICATION_JSON_VALUE)
-    public SettlementAccountResponse updateLiquidityBuffer(
+    @PutMapping(path = "/{accountId}/liquidity-buffer", consumes = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(summary = "Set the liquidity buffer to an absolute value",
+               description = "Naturally idempotent, so no Idempotency-Key is required.")
+    @ApiResponse(responseCode = "200", description = "The updated account")
+    @ApiResponse(responseCode = "400", description = "Malformed amount or body")
+    @ApiResponse(responseCode = "404", description = "No such account")
+    @ApiResponse(responseCode = "409", description = "Concurrent modification; re-read and retry")
+    public SettlementAccountResponse setLiquidityBuffer(
             @PathVariable String accountId,
             @Valid @RequestBody UpdateLiquidityBufferRequest request) {
 
         SettlementAccount existing = repository.findByAccountId(accountId)
                 .orElseThrow(() -> new AccountNotFoundException(accountId));
 
-        // The currency comes from the account, never from the caller, so the
-        // client cannot express a mismatched buffer in the first place.
+        // The currency comes from the account, never the caller, so a mismatched
+        // buffer is not expressible.
         Currency currency = Currency.getInstance(existing.currencyCode());
         Money newBuffer = Money.of(currency, new BigDecimal(request.amount()));
 
         return SettlementAccountResponse.from(repository.updateLiquidityBuffer(accountId, newBuffer));
+    }
+
+    /**
+     * Applies a signed adjustment to the buffer, exactly once per idempotency key.
+     *
+     * <p><b>Why this one needs a key and the PUT does not.</b> "Add 5,000,000" is not
+     * idempotent - applied twice, the money is wrong. And a client whose request
+     * times out cannot tell whether the work happened, so it will retry. Without a
+     * key, that retry is a second adjustment; with one, it is a replay of the first
+     * response and the buffer is untouched.
+     *
+     * <p>This is the specific mechanism behind the job description's
+     * "enterprise grade fast moving payment processing", and it is how Stripe, the
+     * card networks and every payment rail handle retries.
+     *
+     * <p><b>The response carries {@code Idempotency-Replayed}</b> so a client
+     * debugging a retry loop can see that its duplicate was recognised rather than
+     * guessing from an indistinguishable 200.
+     */
+    @PostMapping(path = "/{accountId}/liquidity-buffer-adjustments",
+                 consumes = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(summary = "Adjust the liquidity buffer by a signed delta",
+               description = """
+                       Requires an `Idempotency-Key` header. Repeating a request with the same key
+                       returns the original response and performs no further work; the response
+                       carries `Idempotency-Replayed: true`. Reusing a key with a different payload
+                       is rejected with 422. Keys are honoured for 24 hours.
+                       """)
+    @ApiResponse(responseCode = "200", description = "The updated account")
+    @ApiResponse(responseCode = "400", description = "Missing/blank key, malformed amount, or buffer would go negative")
+    @ApiResponse(responseCode = "404", description = "No such account")
+    @ApiResponse(responseCode = "409", description = "A request with this key is in flight; retry")
+    @ApiResponse(responseCode = "422", description = "This key was already used for a different request")
+    public ResponseEntity<SettlementAccountResponse> adjustLiquidityBuffer(
+            @PathVariable String accountId,
+
+            @Parameter(description = "Client-generated unique key, e.g. a UUID. Honoured for 24 hours.",
+                       required = true, example = "6f1c9e2a-0b7d-4f1e-9a3c-2d5e8b1f4a70")
+            @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
+
+            @Valid @RequestBody AdjustLiquidityBufferRequest request) {
+
+        // An explicitly built, stable string - NOT the JSON of the request. Hashing
+        // JSON looks obvious and is a trap: {"a":1,"b":2} and {"b":2,"a":1} are the
+        // same request with different bytes, so reuse detection would fire on
+        // requests that are actually identical. Canonical JSON is a hard problem;
+        // this sidesteps it.
+        String fingerprint = accountId + '|' + request.amount();
+
+        IdempotencyService.IdempotentResult<SettlementAccountResponse> result =
+                idempotencyService.execute(
+                        idempotencyKey,
+                        OPERATION_ADJUST_BUFFER,
+                        fingerprint,
+                        SettlementAccountResponse.class,
+                        // Runs inside the idempotency service's transaction, so the
+                        // read, the write and the key record all commit together.
+                        () -> SettlementAccountResponse.from(
+                                adjustmentService.adjustBy(accountId, new BigDecimal(request.amount()))));
+
+        return ResponseEntity.ok()
+                .header("Idempotency-Replayed", Boolean.toString(result.replayed()))
+                .body(result.value());
     }
 
     private Jurisdiction parseJurisdiction(String value) {

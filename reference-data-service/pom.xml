@@ -15,6 +15,20 @@
     <name>Reference Data Service</name>
     <description>Legal entities, settlement accounts, currencies and jurisdictions</description>
 
+    <properties>
+        <!--
+          springdoc is NOT managed by the Spring Boot BOM, so we must pin a version
+          ourselves - and it must match the Boot generation. springdoc 2.8.x targets
+          Spring Boot 3.4/3.5; 2.7.x targets 3.3/3.4.
+
+          If this version does not resolve, the error will be
+          "Could not find artifact org.springdoc:springdoc-openapi-starter-webmvc-ui:jar:X".
+          Pick a real one from https://central.sonatype.com/artifact/org.springdoc/springdoc-openapi-starter-webmvc-ui/versions
+          and change this single line. Nothing else depends on the number.
+        -->
+        <springdoc.version>2.8.5</springdoc.version>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>com.atlas.liquidity</groupId>
@@ -34,29 +48,39 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!--
+          LAYER 3: OpenAPI. Brings springdoc, the swagger-annotations we use on the
+          DTOs and controller, and the Swagger UI static resources. The document is
+          generated from the real mappings at startup, so it cannot describe an
+          endpoint that does not exist.
+
+          Operational note for Layer 8: Swagger UI enumerates your whole attack
+          surface in a friendly clickable form, so it belongs behind authentication
+          or disabled outside non-production profiles.
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
         <!-- LAYER 2: persistence -->
 
-        <!-- Spring Data JPA. Brings Hibernate, the JPA API, spring-tx and
-             spring-jdbc (including HikariCP, the connection pool). -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
 
-        <!-- The JDBC driver. runtime scope: our code never imports a Postgres
-             class, it only needs the driver present when the app runs. Getting
-             scopes right keeps compile-time coupling honest. -->
+        <!-- runtime scope: our code never imports a Postgres class, it only needs
+             the driver present when the app runs. -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
 
-        <!-- Flyway: versioned, ordered, checksummed schema migrations.
-             Since Flyway 10, each database family lives in its own artifact -
-             flyway-core alone will start and then fail with "Unsupported
-             Database: PostgreSQL". Forgetting this second dependency is one of
-             the most common Flyway upgrade problems. -->
+        <!-- Since Flyway 10 each database family ships separately. flyway-core
+             alone starts and then fails with "Unsupported Database: PostgreSQL". -->
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
@@ -74,10 +98,10 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Testcontainers: starts a real Postgres in Docker for the duration
-             of a test class. spring-boot-testcontainers adds @ServiceConnection,
-             which wires the container's random port and credentials into the
-             Spring context automatically - no @DynamicPropertySource boilerplate. -->
+        <!-- Testcontainers is still declared but currently unused: Docker Engine 29
+             dropped the Engine API version its bundled docker-java requests, so the
+             integration tests point at the Compose Postgres instead. See
+             AbstractPostgresIntegrationTest for the full story and how to restore it. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-testcontainers</artifactId>
@@ -108,17 +132,17 @@
             </plugin>
 
             <!--
-              LAYER 2: Surefire runs UNIT tests (*Test) in the `test` phase.
-              Failsafe runs INTEGRATION tests (*IT) in the `integration-test`
-              phase, and - crucially - reports their failures in the `verify`
-              phase rather than failing immediately. That ordering exists so
-              that a `post-integration-test` step can always tear down whatever
-              the tests started, even when they failed.
+              Surefire runs UNIT tests (*Test) in the `test` phase; Failsafe runs
+              INTEGRATION tests (*IT) in `integration-test` and reports their
+              failures in `verify`. So `mvn test` is the fast loop and `mvn verify`
+              is the full one.
 
-              The practical effect for you: `mvn test` is the fast loop and
-              needs no Docker; `mvn verify` is the full loop and starts real
-              containers. Being able to say why a project separates the two is
-              a small but reliable signal of build-pipeline experience.
+              classesDirectory is the important line. Failsafe runs AFTER `package`,
+              and by then spring-boot:repackage has replaced the main artifact with a
+              fat jar whose classes live under BOOT-INF/classes/ - invisible to a
+              standard classpath, because a JAR cannot contain another JAR on one.
+              Without this, test discovery dies with ClassNotFoundException on our
+              own classes. Surefire is unaffected because it runs before `package`.
             -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
