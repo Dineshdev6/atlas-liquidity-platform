@@ -1,6 +1,7 @@
 package com.atlas.liquidity.refdata.application;
 
 import com.atlas.liquidity.common.money.Money;
+import com.atlas.liquidity.refdata.api.AccountNotFoundException;
 import com.atlas.liquidity.refdata.domain.SettlementAccount;
 import com.atlas.liquidity.refdata.domain.SettlementAccountRepository;
 import java.math.BigDecimal;
@@ -88,6 +89,41 @@ public class LiquidityBufferAdjustmentService {
         }
 
         log.info("Adjusting buffer for {} by {} -> {}", accountId, adjustment, newBuffer);
+        return accounts.updateLiquidityBuffer(accountId, newBuffer);
+    }
+
+    /**
+     * Sets the buffer to an absolute value, atomically.
+     *
+     * <p>This closes the last deliberate defect carried since Layer 2. The
+     * controller used to do the read and the write itself, which meant two calls
+     * into the repository and therefore <b>two transactions</b> - each repository
+     * method starting and committing its own. Between them another request could
+     * change the account's currency or delete it outright, and nothing would
+     * throw; the row would simply end up wrong.
+     *
+     * <p>With {@code @Transactional} here, both repository calls join <em>this</em>
+     * transaction (default {@code REQUIRED} propagation), so the read and the write
+     * are one atomic unit. Note this is the same reason the adjustment path was
+     * already safe - it is not a property of the endpoint, it is a property of
+     * where the transaction boundary sits.
+     *
+     * <p><b>Still not a substitute for optimistic locking.</b> One transaction
+     * makes the read-modify-write atomic on this path; the {@code @Version} column
+     * is what catches a conflicting write from a different transaction. They solve
+     * different halves of the problem, and knowing which is which is worth a mark
+     * in an interview.
+     */
+    @Transactional
+    public SettlementAccount setTo(String accountId, BigDecimal amount) {
+        SettlementAccount account = accounts.findByAccountId(accountId)
+                .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        // The currency comes from the account, never the caller, so a mismatched
+        // buffer is not expressible.
+        Money newBuffer = Money.of(account.liquidityBuffer().currency(), amount);
+
+        log.info("Setting buffer for {} to {}", accountId, newBuffer);
         return accounts.updateLiquidityBuffer(accountId, newBuffer);
     }
 }

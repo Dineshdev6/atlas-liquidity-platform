@@ -20,6 +20,7 @@ import com.atlas.liquidity.common.query.Page;
 import com.atlas.liquidity.common.query.PageRequest;
 import com.atlas.liquidity.common.query.SortDirection;
 import com.atlas.liquidity.common.web.CorrelationIdFilter;
+import com.atlas.liquidity.refdata.api.AccountNotFoundException;
 import com.atlas.liquidity.refdata.api.SettlementAccountController;
 import com.atlas.liquidity.refdata.api.SettlementAccountResponse;
 import com.atlas.liquidity.refdata.application.LiquidityBufferAdjustmentService;
@@ -367,8 +368,10 @@ class SettlementAccountControllerTest {
         void setsNewBuffer() throws Exception {
             SettlementAccount updated = US_ACCOUNT.withLiquidityBuffer(Money.of("USD", "31000000.00"));
 
-            given(repository.findByAccountId("ACC-US-0001")).willReturn(Optional.of(US_ACCOUNT));
-            given(repository.updateLiquidityBuffer(eq("ACC-US-0001"), any(Money.class))).willReturn(updated);
+            // EXERCISE 3: the controller no longer orchestrates this. It delegates to
+            // the application service, which owns one transaction spanning the read
+            // and the write - so the slice test mocks the service, not the repository.
+            given(adjustmentService.setTo(eq("ACC-US-0001"), any(BigDecimal.class))).willReturn(updated);
 
             mockMvc.perform(put("/api/v1/accounts/ACC-US-0001/liquidity-buffer")
                             .contentType(MediaType.APPLICATION_JSON)
@@ -380,7 +383,12 @@ class SettlementAccountControllerTest {
         @Test
         @DisplayName("PUT to an unknown account is a 404 and never reaches the update")
         void unknownAccountIsNotFound() throws Exception {
-            given(repository.findByAccountId("ACC-NOPE")).willReturn(Optional.empty());
+            // The 404 now originates inside the service rather than the controller,
+            // but the wire contract is deliberately unchanged - same status, same
+            // problem-detail body, same accountId property. Moving a transaction
+            // boundary is not licence to move the API contract with it.
+            given(adjustmentService.setTo(eq("ACC-NOPE"), any(BigDecimal.class)))
+                    .willThrow(new AccountNotFoundException("ACC-NOPE"));
 
             mockMvc.perform(put("/api/v1/accounts/ACC-NOPE/liquidity-buffer")
                             .contentType(MediaType.APPLICATION_JSON)
@@ -400,6 +408,7 @@ class SettlementAccountControllerTest {
                     .andExpect(jsonPath("$.errors.amount").exists());
 
             verifyNoInteractions(repository);
+            verifyNoInteractions(adjustmentService);
         }
 
         @Test

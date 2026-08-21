@@ -1,6 +1,5 @@
 package com.atlas.liquidity.refdata.api;
 
-import com.atlas.liquidity.common.money.Money;
 import com.atlas.liquidity.common.query.Page;
 import com.atlas.liquidity.common.query.PageRequest;
 import com.atlas.liquidity.common.query.SortDirection;
@@ -18,7 +17,6 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.math.BigDecimal;
 import java.util.Arrays;
-import java.util.Currency;
 import java.util.Locale;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -143,11 +141,10 @@ public class SettlementAccountController {
      * it once. A client whose call times out can simply retry. Compare the POST
      * below, which cannot.
      *
-     * <p><b>A known defect, still here.</b> This reads the account and then updates
-     * it in two separate transactions, so another request could change or delete it
-     * in between. The adjustment endpoint below does not have this problem, because
-     * it goes through an application service that owns one transaction. Moving this
-     * method onto the same service is a small change and a good exercise.
+     * <p><b>The Layer 2 defect, now closed.</b> This used to read the account and
+     * then update it in two separate transactions, so another request could change
+     * or delete it in between. It now goes through the same application service as
+     * the adjustment endpoint, so the read and the write share one transaction.
      */
     @PutMapping(path = "/{accountId}/liquidity-buffer", consumes = MediaType.APPLICATION_JSON_VALUE)
     @Operation(summary = "Set the liquidity buffer to an absolute value",
@@ -160,15 +157,10 @@ public class SettlementAccountController {
             @PathVariable String accountId,
             @Valid @RequestBody UpdateLiquidityBufferRequest request) {
 
-        SettlementAccount existing = repository.findByAccountId(accountId)
-                .orElseThrow(() -> new AccountNotFoundException(accountId));
-
-        // The currency comes from the account, never the caller, so a mismatched
-        // buffer is not expressible.
-        Currency currency = Currency.getInstance(existing.currencyCode());
-        Money newBuffer = Money.of(currency, new BigDecimal(request.amount()));
-
-        return SettlementAccountResponse.from(repository.updateLiquidityBuffer(accountId, newBuffer));
+        // One call, one transaction. The service owns the boundary now, exactly as
+        // it does for the adjustment below.
+        return SettlementAccountResponse.from(
+                adjustmentService.setTo(accountId, new BigDecimal(request.amount())));
     }
 
     /**
