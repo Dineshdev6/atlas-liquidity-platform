@@ -1,10 +1,13 @@
 package com.atlas.liquidity.refdata.application;
 
+import com.atlas.liquidity.common.events.LiquidityBufferChangedEvent;
 import com.atlas.liquidity.common.money.Money;
 import com.atlas.liquidity.refdata.api.AccountNotFoundException;
 import com.atlas.liquidity.refdata.domain.SettlementAccount;
 import com.atlas.liquidity.refdata.domain.SettlementAccountRepository;
+import com.atlas.liquidity.refdata.outbox.OutboxWriter;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.NoSuchElementException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,9 +49,11 @@ public class LiquidityBufferAdjustmentService {
     private static final Logger log = LoggerFactory.getLogger(LiquidityBufferAdjustmentService.class);
 
     private final SettlementAccountRepository accounts;
+    private final OutboxWriter outbox;
 
-    LiquidityBufferAdjustmentService(SettlementAccountRepository accounts) {
+    LiquidityBufferAdjustmentService(SettlementAccountRepository accounts, OutboxWriter outbox) {
         this.accounts = accounts;
+        this.outbox = outbox;
     }
 
     /**
@@ -89,7 +94,16 @@ public class LiquidityBufferAdjustmentService {
         }
 
         log.info("Adjusting buffer for {} by {} -> {}", accountId, adjustment, newBuffer);
-        return accounts.updateLiquidityBuffer(accountId, newBuffer);
+        SettlementAccount updated = accounts.updateLiquidityBuffer(accountId, newBuffer);
+
+        // LAYER 4. The event is written to the outbox INSIDE this transaction,
+        // which is the whole pattern in one line. If the update below had already
+        // committed and a Kafka send then failed, the money would have moved with
+        // nobody told. Here there is no send: the event is a row, and it commits
+        // or rolls back with the balance it describes.
+        recordChange(account, updated, LiquidityBufferChangedEvent.CHANGE_TYPE_ADJUSTMENT, null);
+
+        return updated;
     }
 
     /**
@@ -124,6 +138,65 @@ public class LiquidityBufferAdjustmentService {
         Money newBuffer = Money.of(account.liquidityBuffer().currency(), amount);
 
         log.info("Setting buffer for {} to {}", accountId, newBuffer);
-        return accounts.updateLiquidityBuffer(accountId, newBuffer);
+        SettlementAccount updated = accounts.updateLiquidityBuffer(accountId, newBuffer);
+
+        recordChange(account, updated, LiquidityBufferChangedEvent.CHANGE_TYPE_ABSOLUTE_SET, null);
+
+        return updated;
+    }
+
+    /**
+     * Records the change as a domain event, in the caller's transaction.
+     *
+     * <p>Note what the event carries and what it does not. It carries the account
+     * id, both buffer values and when it happened - everything a consumer needs
+     * to act without calling back to ask. It does not carry the whole account:
+     * an event describing a change should describe the change, and a consumer
+     * that needs the account's BIC can look it up. Fat events couple every
+     * consumer to every field you ever add.
+     *
+     * <p><b>Both the previous and the new value are included</b> so that each
+     * message stands alone. A consumer replaying the topic from the beginning, or
+     * joining after a gap, can reason about one message without having seen the
+     * one before it - and can notice that it missed something, which a
+     * new-value-only event makes impossible.
+     */
+    private void recordChange(SettlementAccount before, SettlementAccount after,
+                              String changeType, String reason) {
+
+        // The id is generated first so that the SAME value goes into the outbox
+        // row and into the payload. The row's copy is ours, for support queries;
+        // the payload's copy is the one that travels, and it is the value a
+        // consumer will store to recognise a redelivery of this exact event.
+        String eventId = outbox.newEventId();
+
+        LiquidityBufferChangedEvent event = new LiquidityBufferChangedEvent(
+                eventId,
+                after.accountId(),
+                after.liquidityBuffer().currencyCode(),
+                before.liquidityBuffer().amount().toPlainString(),
+                after.liquidityBuffer().amount().toPlainString(),
+                changeType,
+                reason,
+                Instant.now());
+
+        outbox.record(
+                eventId,
+                LiquidityBufferChangedEvent.AGGREGATE_TYPE,
+                after.accountId(),
+                LiquidityBufferChangedEvent.EVENT_TYPE,
+                // THE PARTITION KEY. Every event for one account goes to one
+                // partition, and Kafka guarantees order within a partition - so a
+                // consumer sees this account's changes in the order they happened.
+                // Key by something else, or leave it null, and "set to 20m" can
+                // arrive after "set to 15m" and the last write wins, wrongly.
+                //
+                // The trade-off, which you should raise before an interviewer
+                // does: a single very busy account becomes a hot partition, and
+                // one partition is handled by exactly one consumer in a group, so
+                // that account's throughput cannot be scaled out. You accept it
+                // when ordering matters more than parallelism, which here it does.
+                after.accountId(),
+                event);
     }
 }

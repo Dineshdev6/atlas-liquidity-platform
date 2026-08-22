@@ -1,7 +1,7 @@
 # Local infrastructure for the Atlas Liquidity Platform.
 #
 # LAYER 2 TEACHING NOTE
-#
+# ---------------------
 # Why Postgres when the job description says Oracle?
 #
 # Because Oracle's licensed images are painful to obtain and enormous to run,
@@ -10,17 +10,24 @@
 # problem - is identical on both. ADR 0004 records this decision and lists the
 # specific places where Oracle genuinely differs, so you can speak to them.
 #
-# Two databases are created here:
-#   atlas_liquidity        the application uses this
-#   atlas_liquidity_test   the integration tests use this
+# LAYER 4 TEACHING NOTE
+# ---------------------
+# Kafka runs in KRaft mode - no ZooKeeper. Every Kafka tutorial older than about
+# 2023 starts a ZooKeeper container alongside the broker; ZooKeeper held cluster
+# metadata (which broker leads which partition, who is in the ISR). KRaft moves
+# that metadata into Kafka itself, as an internal log, managed by controller
+# nodes. One less distributed system to operate, faster failover, and far more
+# partitions per cluster. If an interviewer mentions ZooKeeper, knowing it is on
+# its way out - removed entirely in Kafka 4.0 - is a current-knowledge signal.
 #
-# See docker/postgres-init/01-create-test-database.sql for why they are separate.
+# This is ONE broker with a replication factor of ONE. That is a laptop, not a
+# bank: a real cluster runs at least three brokers with replication factor 3 and
+# min.insync.replicas=2, so a single machine failure loses nothing. Be explicit
+# about that difference rather than pretending this is production-shaped.
 #
 # Start it:   docker compose up -d
 # Stop it:    docker compose down
-# Wipe it:    docker compose down -v      (deletes the volume - full reset,
-#                                          and the only way to re-run the
-#                                          init scripts below)
+# Wipe it:    docker compose down -v      (deletes the volumes - full reset)
 
 services:
   postgres:
@@ -34,10 +41,6 @@ services:
       - "5432:5432"
     volumes:
       - atlas-pgdata:/var/lib/postgresql/data
-      # Anything in this directory runs once, when the data volume is first
-      # created. Mounted read-only because the container has no business
-      # modifying our scripts.
-      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Kubernetes readiness probes in Layer 10 are the same idea: do not send
       # traffic to a container until it can actually answer.
@@ -45,6 +48,79 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: atlas-kafka
+    ports:
+      # 9092 is the listener your application and the CLI on your laptop use.
+      - "9092:9092"
+    environment:
+      # --- KRaft: this single container is both broker and controller ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+
+      # --- Listeners ---
+      # THREE listeners, and the reason is the single most common Kafka-in-Docker
+      # trip-up. A Kafka client does not keep talking to the address you gave it:
+      # it asks the broker for metadata, and the broker replies with the
+      # ADVERTISED address of whichever broker leads each partition. The client
+      # then connects to THAT.
+      #
+      # So a broker advertising "kafka:19092" is unreachable from your laptop
+      # (no such hostname), and a broker advertising "localhost:9092" is
+      # unreachable from another container (localhost means itself). Hence one
+      # listener advertised as "kafka:19092" for container-to-container traffic
+      # and one advertised as "localhost:9092" for you.
+      #
+      # "It connects and then times out" is almost always this.
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # --- Single-node settings ---
+      # All of these are 1 only because there is one broker. In production every
+      # one of them would be 3, and min.insync.replicas would be 2 so that a
+      # producer using acks=all survives losing a broker.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Auto-created topics get 3 partitions, so partitioning by account key is
+      # observable rather than theoretical. Note that auto-creation itself is
+      # switched OFF in most banks - a typo in a topic name silently creating a
+      # new topic is not a feature. Part 2 declares topics explicitly.
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Optional, but worth having: a browser view of topics, partitions, offsets and
+  # message payloads. Seeing a message sitting on partition 2 with your account
+  # id as its key makes partitioning concrete in a way a diagram does not.
+  # Comment this service out if you would rather save the memory.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: atlas-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: atlas-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
 
 volumes:
   atlas-pgdata:

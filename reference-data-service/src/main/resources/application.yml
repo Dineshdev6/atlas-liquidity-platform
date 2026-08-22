@@ -63,6 +63,51 @@ spring:
     baseline-on-migrate: false
     validate-on-migrate: true
 
+  # ---------------------------------------------------------------------------
+  # LAYER 4: Kafka
+  # ---------------------------------------------------------------------------
+  # Only the address lives here. Everything else about the producer - acks,
+  # idempotence, retries, batching - is declared in KafkaProducerConfig, in Java,
+  # where each setting can carry the reason it was chosen. Configuration that
+  # matters deserves a comment more than it deserves a YAML line.
+  #
+  # Note the service starts perfectly well with no broker running: a Kafka
+  # producer connects lazily, on first send. The relay will log warnings once a
+  # second and the outbox will grow, which is exactly the designed behaviour -
+  # nothing is lost, it is simply not published yet. Try it: stop the Kafka
+  # container while the service is running and watch the backlog build, then
+  # start it again and watch it drain.
+  kafka:
+    bootstrap-servers: localhost:9092
+
+# ---------------------------------------------------------------------------
+# LAYER 4: outbox relay
+# ---------------------------------------------------------------------------
+atlas:
+  outbox:
+    # Topic naming: <organisation>.<domain>.<event>.<major version>. The version
+    # is in the NAME because a breaking schema change then becomes a new topic
+    # that old consumers simply never see, rather than a poisoned message they
+    # cannot parse. Part 3 adds a schema registry, which handles the compatible
+    # changes; the topic version is for the incompatible ones.
+    topic: atlas.liquidity.buffer-changed.v1
+
+    # One second. Latency you would not accept for a user-facing read, and
+    # completely unremarkable for asynchronous propagation - the position engine
+    # does not care whether it learns about a buffer change now or in 800ms, it
+    # cares that it learns exactly once and in order. If it ever did care, the
+    # answer is change data capture, not a tighter poll.
+    poll-interval-ms: 1000
+
+    # Give the application time to finish starting before the first run. A
+    # scheduled job firing while the context is still coming up is a classic
+    # source of confusing startup failures.
+    initial-delay-ms: 5000
+
+    # Switched off in the integration-test profile so tests can inspect outbox
+    # rows deterministically instead of racing a timer.
+    relay-enabled: true
+
 server:
   port: 8081
   shutdown: graceful
@@ -93,13 +138,18 @@ management:
 info:
   app:
     name: Reference Data Service
-    layer: "2 - domain model and persistence"
+    layer: "4 - event-driven backbone (part 1: transactional outbox)"
 
 logging:
   pattern:
     console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"
   level:
     com.atlas.liquidity: DEBUG
+    # Kafka's own client logging is extremely chatty at INFO - it prints the
+    # full producer configuration on startup and a line per metadata refresh.
+    # Raised to WARN so your own logs stay readable. Drop it back to INFO when
+    # you actually need to see what the client is negotiating.
+    org.apache.kafka: WARN
     # Uncomment these two to see every SQL statement Hibernate issues, with
     # bound parameters. This is how you SEE the N+1 problem rather than reading
     # about it - do it once, deliberately, in Layer 2's exercises.
