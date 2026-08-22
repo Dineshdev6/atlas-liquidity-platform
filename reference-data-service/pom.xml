@@ -64,6 +64,20 @@
             <version>${springdoc.version}</version>
         </dependency>
 
+        <!--
+          LAYER 4: Kafka.
+
+          No version. spring-kafka IS managed by the Spring Boot BOM we imported
+          in the root POM, unlike springdoc above - so Boot picks a spring-kafka
+          that matches this Boot generation, and spring-kafka in turn pins a
+          compatible kafka-clients. Letting the BOM choose is the whole reason
+          for importing one.
+        -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
         <!-- LAYER 2: persistence -->
 
         <dependency>

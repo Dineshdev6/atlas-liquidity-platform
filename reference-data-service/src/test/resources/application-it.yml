@@ -8,6 +8,14 @@
 # open-in-view: false, the logging pattern - is inherited from the main config.
 # That matters: the tests exercise the SAME settings the application runs with,
 # apart from which database they point at.
+#
+# ONE YAML RULE WORTH LEARNING THE EASY WAY
+# Every top-level key appears EXACTLY ONCE in a YAML document. Writing "spring:"
+# twice does not merge the two blocks - Spring Boot refuses to load the file at
+# all, and because this file only loads under the "it" profile the damage shows
+# up as every single integration test failing to build its ApplicationContext
+# while the unit tests carry on passing. If a whole IT suite dies at once and
+# the unit tests are fine, suspect the profile's config file before the code.
 
 spring:
   datasource:
@@ -36,6 +44,14 @@ spring:
     hibernate:
       ddl-auto: validate
 
+  # LAYER 4. Present so the producer bean can be built. Nothing in the
+  # integration tests actually sends: OutboxIT asserts on rows in the outbox
+  # table, and the publish path is covered by OutboxPublisherTest with a mocked
+  # KafkaTemplate. A Kafka producer connects lazily, on first send, so the whole
+  # suite still runs with no broker on the machine.
+  kafka:
+    bootstrap-servers: localhost:9092
+
 logging:
   level:
     # Uncomment to watch the SQL the tests generate. Doing this once, and
@@ -44,3 +60,22 @@ logging:
     # org.hibernate.orm.jdbc.bind: TRACE
     org.flywaydb: INFO
     com.zaxxer.hikari: INFO
+    org.apache.kafka: WARN
+
+# ---------------------------------------------------------------------------
+# LAYER 4: the outbox relay is DISABLED for integration tests
+# ---------------------------------------------------------------------------
+# A testing decision worth understanding rather than a convenience.
+#
+# With the timer running, it would race every test: assert that an outbox row is
+# unpublished and you are asserting against a stopwatch; assert that one exists
+# and the relay may already have stamped it. Tests that depend on wall-clock
+# timing are the flakiest tests there are, and a flaky test is worse than no
+# test because it trains people to re-run the build instead of reading it.
+#
+# So the timer is off and OutboxIT calls publisher.publishPending() directly.
+# The scheduling is trivial and framework-owned; the publishing logic is ours,
+# and that is what deserves the test.
+atlas:
+  outbox:
+    relay-enabled: false
