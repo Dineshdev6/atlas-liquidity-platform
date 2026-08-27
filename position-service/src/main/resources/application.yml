@@ -1,0 +1,103 @@
+spring:
+  application:
+    name: position-service
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+
+  # ---------------------------------------------------------------------------
+  # ITS OWN DATABASE
+  # ---------------------------------------------------------------------------
+  # Different database from reference-data-service, on the same Postgres instance
+  # only because this is a laptop. The point is that this service cannot read the
+  # other one's tables even if someone wanted it to.
+  #
+  # Database-per-service is the part of "microservices" people skip, and skipping
+  # it is what produces a distributed monolith: services that must be deployed
+  # together because a schema change breaks two of them, with all the operational
+  # cost of a distributed system and none of the independence. Everything this
+  # service knows, it learned from a Kafka topic.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/atlas_positions
+    username: atlas
+    password: atlas
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 3000
+      pool-name: atlas-position-pool
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+# ---------------------------------------------------------------------------
+# What this service listens to
+# ---------------------------------------------------------------------------
+atlas:
+  events:
+    buffer-changed-topic: atlas.liquidity.buffer-changed.v1
+
+    # THE CONSUMER GROUP, and it is the most consequential string in this file.
+    #
+    # Kafka assigns each partition to exactly one member of a group, so every
+    # instance of this service sharing this id means the work is split between
+    # them and each event is handled once by the group. Start a service with a
+    # DIFFERENT id and it is a separate subscription that receives every event
+    # from the beginning of the topic - which is how you add a new consumer
+    # without disturbing an existing one, and also how you accidentally reprocess
+    # six months of history.
+    #
+    # Changing this value in production is therefore not a rename. It is a
+    # reset-and-replay.
+    consumer-group: atlas-position-service
+
+server:
+  port: 8082
+  shutdown: graceful
+  error:
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    db:
+      enabled: true
+
+info:
+  app:
+    name: Position Service
+    layer: "4 - event-driven backbone (part 2: idempotent consumers)"
+
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation-id}] %logger{36} - %msg%n"
+  level:
+    com.atlas.liquidity: DEBUG
+    org.apache.kafka: WARN
+    # Uncomment to watch partition assignment and rebalancing happen. Worth doing
+    # once while starting a second instance - the reassignment is the thing most
+    # people have only read about.
+    # org.springframework.kafka: DEBUG

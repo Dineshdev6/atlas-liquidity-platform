@@ -37,6 +37,7 @@
     <modules>
         <module>liquidity-common</module>
         <module>reference-data-service</module>
+        <module>position-service</module>
     </modules>
 
     <properties>
