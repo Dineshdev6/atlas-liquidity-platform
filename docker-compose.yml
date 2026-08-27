@@ -41,6 +41,11 @@ services:
       - "5432:5432"
     volumes:
       - atlas-pgdata:/var/lib/postgresql/data
+      # Runs ONCE, when the data directory is empty. Creates the test database
+      # and the two position-service databases. On an existing volume Postgres
+      # ignores this entirely - which is why Layer 4 part 2 also gives you the
+      # createdb commands to run by hand the first time.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Kubernetes readiness probes in Layer 10 are the same idea: do not send
       # traffic to a container until it can actually answer.
