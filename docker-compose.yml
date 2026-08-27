@@ -54,9 +54,34 @@ services:
       timeout: 3s
       retries: 10
 
+  # An INIT CONTAINER, and worth recognising by name: it does one small job,
+  # exits, and the real container waits for it to succeed. Kubernetes has exactly
+  # this concept - initContainers - and Layer 10 will use them for the same kind
+  # of work.
+  #
+  # The job here is preparing the volume. A fresh Docker named volume is created
+  # root-owned when its mount point does not already exist inside the image, and
+  # the apache/kafka image runs as a non-root user - so the broker would start,
+  # fail to write its log directory, and exit. This runs first and makes the
+  # directory writable.
+  #
+  # chmod 777 is a laptop shortcut and should be recognised as one. The correct
+  # answers are a Dockerfile that creates the directory owned by the runtime user,
+  # or in Kubernetes a securityContext with fsGroup, which makes the kubelet set
+  # group ownership on the mounted volume for you.
+  kafka-init:
+    image: busybox:1.36
+    container_name: atlas-kafka-init
+    command: ["sh", "-c", "mkdir -p /var/lib/kafka/data && chmod -R 777 /var/lib/kafka/data"]
+    volumes:
+      - atlas-kafka-data:/var/lib/kafka/data
+
   kafka:
     image: apache/kafka:3.9.0
     container_name: atlas-kafka
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
     ports:
       # 9092 is the listener your application and the CLI on your laptop use.
       - "9092:9092"
@@ -103,7 +128,19 @@ services:
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
 
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      # NOT /tmp. The image's default log directory is under /tmp with no volume
+      # behind it, so the entire broker log - every topic, every message, every
+      # consumer offset - lives in the container's writable layer and is destroyed
+      # the moment the container is recreated.
+      #
+      # That is how a topic full of events vanished on 26 Aug while the outbox
+      # still showed them as published: the producer had genuinely sent them, and
+      # the broker that received them no longer existed. Postgres had a volume
+      # from Layer 2; Kafka did not. Durable-by-default is a property you have to
+      # arrange, not one you get.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - atlas-kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -129,3 +166,4 @@ services:
 
 volumes:
   atlas-pgdata:
+  atlas-kafka-data:
