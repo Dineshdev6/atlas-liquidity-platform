@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 
 /**
  * One account's position, derived entirely from events.
@@ -67,6 +68,36 @@ public class AccountPositionEntity {
     @Column(name = "updated_at", nullable = false)
     private OffsetDateTime updatedAt;
 
+    /**
+     * Everything time-related in this class is truncated to microseconds, and it
+     * is not a detail.
+     *
+     * <p>Postgres {@code TIMESTAMPTZ} stores microseconds and silently truncates
+     * anything finer. {@code Instant.now()} carries sub-microsecond digits. So a
+     * value written and read back is <em>smaller</em> than the one in memory - and
+     * a staleness check comparing an in-memory instant against a round-tripped one
+     * concludes that an event is newer than itself. Two deliveries of the same
+     * event would then both be applied.
+     *
+     * <p>It is a latent bug rather than an obvious one, because whether it bites
+     * depends on whether the clock happened to land on an exact microsecond. It
+     * passed by luck for several days.
+     *
+     * <p>Truncating here makes the domain agree with the two things either side of
+     * it: the database stores microseconds, and the Avro wire format declares
+     * {@code timestamp-micros}. When three layers disagree about precision, the
+     * fix is to make them agree, not to loosen the comparison.
+     *
+     * <p>The deeper fix, still owed and named in ADR 0008: order on a monotonic
+     * sequence number from the producer rather than a wall clock. The outbox's
+     * generated id is already exactly that; it simply is not carried in the
+     * payload yet. Clocks are not to be trusted for ordering, and two events can
+     * legitimately share a microsecond.
+     */
+    private static OffsetDateTime toStorablePrecision(Instant instant) {
+        return instant.truncatedTo(ChronoUnit.MICROS).atOffset(ZoneOffset.UTC);
+    }
+
     /** Required by JPA. Not for application use. */
     protected AccountPositionEntity() {
     }
@@ -77,7 +108,7 @@ public class AccountPositionEntity {
         this.currencyCode = currencyCode;
         this.currentBuffer = currentBuffer;
         this.lastEventId = lastEventId;
-        this.lastEventAt = lastEventAt.atOffset(ZoneOffset.UTC);
+        this.lastEventAt = toStorablePrecision(lastEventAt);
         this.appliedCount = 1;
         this.updatedAt = OffsetDateTime.now(ZoneOffset.UTC);
     }
@@ -126,7 +157,11 @@ public class AccountPositionEntity {
      * millisecond and clocks are not to be trusted - worth saying out loud.
      */
     public boolean isStale(Instant occurredAt) {
-        return !occurredAt.isAfter(lastEventAt.toInstant());
+        // Both sides truncated, so the comparison is between like and like. Without
+        // this, an in-memory instant is compared against one that a round trip
+        // through Postgres has already shortened, and every event looks newer than
+        // the state it produced.
+        return !occurredAt.truncatedTo(ChronoUnit.MICROS).isAfter(lastEventAt.toInstant());
     }
 
     /**
@@ -139,7 +174,7 @@ public class AccountPositionEntity {
     public void apply(BigDecimal newBuffer, String eventId, Instant occurredAt) {
         this.currentBuffer = newBuffer;
         this.lastEventId = eventId;
-        this.lastEventAt = occurredAt.atOffset(ZoneOffset.UTC);
+        this.lastEventAt = toStorablePrecision(occurredAt);
         this.appliedCount++;
         this.updatedAt = OffsetDateTime.now(ZoneOffset.UTC);
     }

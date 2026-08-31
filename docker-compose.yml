@@ -148,6 +148,46 @@ services:
       retries: 12
       start_period: 20s
 
+  # LAYER 4 PART 3. The schema registry: an HTTP service that stores Avro schemas,
+  # hands out an integer id for each, and - the part that matters - REFUSES to
+  # register a new version that is incompatible with the ones already there.
+  #
+  # Note where it keeps them: in a Kafka topic called _schemas. It is not a
+  # database with its own backup story; it is a compacted log in the cluster it
+  # serves, which is a neat piece of design and also means losing the cluster
+  # loses the registry.
+  #
+  # Port 8085, not Confluent's default 8081, because 8081 is reference-data-service.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    container_name: atlas-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:19092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8085
+
+      # BACKWARD is the default and the right one for most systems, and it is
+      # worth being able to say precisely what it means: a NEW schema must be able
+      # to read data written by the OLD one. So consumers can be upgraded first,
+      # then producers - which is the safe deployment order, because a consumer
+      # that understands both shapes can never be surprised.
+      #
+      # FORWARD is the mirror: old schema reads new data, so producers upgrade
+      # first. FULL is both. NONE turns the whole thing off and is how teams end
+      # up with a registry that stores schemas and enforces nothing.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8085/subjects || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   # Optional, but worth having: a browser view of topics, partitions, offsets and
   # message payloads. Seeing a message sitting on partition 2 with your account
   # id as its key makes partitioning concrete in a way a diagram does not.
@@ -157,11 +197,15 @@ services:
     container_name: atlas-kafka-ui
     depends_on:
       - kafka
+      - schema-registry
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: atlas-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      # Point the UI at the registry too, so it can decode Avro messages for you
+      # and show the registered schemas and their versions.
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8085
       DYNAMIC_CONFIG_ENABLED: "true"
 
 volumes:

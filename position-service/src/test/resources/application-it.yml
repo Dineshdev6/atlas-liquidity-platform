@@ -54,6 +54,13 @@ logging:
     org.springframework.kafka: WARN
 
 atlas:
+  # Present so the consumer and DLT producer beans can be built. No integration
+  # test starts a listener or sends anything, so nothing here actually contacts
+  # the registry - the suite still runs with no broker and no registry on the
+  # machine.
+  schema-registry:
+    url: http://localhost:8085
+
   events:
-    buffer-changed-topic: atlas.liquidity.buffer-changed.v1
+    buffer-changed-topic: atlas.liquidity.buffer-changed.v2
     consumer-group: atlas-position-service-it

@@ -25,10 +25,32 @@
       confusing multi-module mistake.
     -->
 
+    <properties>
+        <!--
+          Avro is NOT managed by the Spring Boot BOM, so we pin it - and the
+          version has to agree with the one Confluent's serialisers were built
+          against, or generated code and runtime disagree in ways that surface as
+          NoSuchMethodError rather than anything helpful. Confluent 7.7.x ships
+          Avro 1.11.3.
+        -->
+        <avro.version>1.11.3</avro.version>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!--
+          LAYER 4 PART 3: the Avro runtime. The generated classes below extend
+          SpecificRecordBase from this jar, so it is a compile dependency of every
+          module that touches an event.
+        -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>${avro.version}</version>
         </dependency>
 
         <!-- provided: the servlet container supplies this at runtime -->
@@ -44,5 +66,46 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              CODE GENERATION FROM THE SCHEMA, and the direction matters.
+
+              The .avsc file is the source of truth; the Java class is an output,
+              regenerated on every build into target/generated-sources. Nobody
+              edits it, nobody commits it. The alternative - write the Java class
+              and derive a schema from it - looks more convenient and quietly makes
+              your wire contract a side effect of a refactor, which is how a field
+              rename becomes an outage.
+
+              stringType=String is the one setting people regret leaving out.
+              Without it Avro generates CharSequence fields holding its own Utf8
+              type, so every comparison, every map key and every log line needs a
+              toString() and equals() silently returns false against a String.
+            -->
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <version>${avro.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-event-classes</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/src/main/avro</sourceDirectory>
+                            <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                            <stringType>String</stringType>
+                            <fieldVisibility>PRIVATE</fieldVisibility>
+                            <createSetters>false</createSetters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

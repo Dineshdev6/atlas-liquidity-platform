@@ -1,5 +1,9 @@
 package com.atlas.liquidity.refdata.config;
 
+import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import io.confluent.kafka.serializers.subject.TopicNameStrategy;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -20,28 +24,57 @@ import org.springframework.kafka.core.ProducerFactory;
  * movements should not be running on whatever the library authors happened to
  * choose.
  *
- * <p>Serialising to {@code String} rather than to objects is also deliberate.
- * The payload was serialised once, when the event was recorded, and has been
- * sitting in the outbox as text ever since. Deserialising it back into an object
- * only to re-serialise it here would be work that can only introduce
- * differences. Part 3 replaces this with Avro and a schema registry.
+ * <p><b>Values are Avro; keys stay Strings.</b> Keys and values are serialised
+ * independently, and a String key remains readable in every console tool - worth
+ * far more on a value you will grep for than the few bytes an Avro key would save.
  */
 @Configuration
 public class KafkaProducerConfig {
 
     private final String bootstrapServers;
+    private final String schemaRegistryUrl;
 
-    public KafkaProducerConfig(@Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+    public KafkaProducerConfig(
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            @Value("${atlas.schema-registry.url:http://localhost:8085}") String schemaRegistryUrl) {
         this.bootstrapServers = bootstrapServers;
+        this.schemaRegistryUrl = schemaRegistryUrl;
     }
 
     @Bean
-    public ProducerFactory<String, String> producerFactory() {
+    public ProducerFactory<String, Object> producerFactory() {
         Map<String, Object> props = new HashMap<>();
 
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+
+        // LAYER 4 PART 3. The value is now Avro, serialised through the schema
+        // registry. What goes on the wire is: one magic byte, a four-byte schema
+        // id, then the Avro binary. The field NAMES are not in the message at all
+        // - they live in the registry, which is why Avro is dramatically smaller
+        // than JSON on a high-volume feed.
+        //
+        // The consequence people trip over: kafka-console-consumer can no longer
+        // read these messages, it prints bytes. You need
+        // kafka-avro-console-consumer, which knows to ask the registry.
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+        props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
+
+        // Register a schema the producer has not seen before rather than refusing
+        // to start. Right for a service that owns its own event; in a large bank
+        // this is often FALSE in production, so schemas are registered by a
+        // deliberate pipeline step and an application can never invent one at
+        // runtime. Worth knowing both positions and why.
+        props.put(KafkaAvroSerializerConfig.AUTO_REGISTER_SCHEMAS, true);
+
+        // The subject the schema is registered under. TopicNameStrategy - the
+        // default - uses "<topic>-value", so one topic carries one value schema
+        // and compatibility is enforced per topic. The alternatives
+        // (RecordNameStrategy, TopicRecordNameStrategy) let several event types
+        // share a topic, which is genuinely useful when ordering across event
+        // types matters, and costs you the simple "this topic has this shape" rule.
+        props.put(KafkaAvroSerializerConfig.VALUE_SUBJECT_NAME_STRATEGY,
+                TopicNameStrategy.class.getName());
 
         // acks=all: do not consider a send successful until every in-sync replica
         // has the record. The default in modern clients, and non-negotiable for
@@ -119,7 +152,7 @@ public class KafkaProducerConfig {
     }
 
     @Bean
-    public KafkaTemplate<String, String> kafkaTemplate(ProducerFactory<String, String> producerFactory) {
+    public KafkaTemplate<String, Object> kafkaTemplate(ProducerFactory<String, Object> producerFactory) {
         return new KafkaTemplate<>(producerFactory);
     }
 }

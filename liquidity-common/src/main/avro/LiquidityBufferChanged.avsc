@@ -1,0 +1,52 @@
+{
+  "namespace": "com.atlas.liquidity.common.events.avro",
+  "type": "record",
+  "name": "LiquidityBufferChanged",
+  "doc": "A settlement account's intraday liquidity buffer changed. This file IS the contract: it is registered with the schema registry, and the registry refuses any future version that an existing consumer could not read.",
+  "fields": [
+    {
+      "name": "eventId",
+      "type": "string",
+      "doc": "Unique id of this event. Consumers deduplicate on it, because delivery is at-least-once."
+    },
+    {
+      "name": "accountId",
+      "type": "string",
+      "doc": "The settlement account affected. Also the Kafka message key, which is what gives per-account ordering."
+    },
+    {
+      "name": "currencyCode",
+      "type": "string",
+      "doc": "ISO-4217 code of the account."
+    },
+    {
+      "name": "previousBuffer",
+      "type": "string",
+      "doc": "Buffer before the change, as a decimal string. A string and not a double: Avro has no decimal primitive beyond bytes-with-a-logical-type, and binary floating point cannot represent money. Avro CAN do decimals, as bytes with a decimal logical type - it is deliberately not used here because it forces every consumer to know the scale, and a string is unambiguous to a human reading a dead-lettered message at 3am."
+    },
+    {
+      "name": "newBuffer",
+      "type": "string",
+      "doc": "Buffer after the change, as a decimal string."
+    },
+    {
+      "name": "changeType",
+      "type": "string",
+      "doc": "ADJUSTMENT (signed delta) or ABSOLUTE_SET. A string rather than an Avro enum on purpose: adding a symbol to an enum is a compatibility minefield, because a consumer with the old schema has no symbol to map a new one onto. Avro 1.9+ supports an enum default to soften that, and the failure mode is still surprising. Strings evolve painlessly."
+    },
+    {
+      "name": "reason",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Free-text audit note. A UNION with null, and note the default - a field that can be absent must be a union including null AND carry a default, or a consumer using an older schema has nothing to fall back on."
+    },
+    {
+      "name": "occurredAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-micros"
+      },
+      "doc": "When the change was applied. A logical type: the wire format is a plain long, and the schema tells Avro to hand your code a java.time.Instant. Microsecond precision, so nanoseconds from Instant.now() are truncated - which is fine here and worth knowing before someone asserts on exact equality."
+    }
+  ]
+}

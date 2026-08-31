@@ -84,13 +84,31 @@ spring:
 # LAYER 4: outbox relay
 # ---------------------------------------------------------------------------
 atlas:
+  # LAYER 4 PART 3. Where the event schemas live.
+  #
+  # 8085 rather than 8081, because 8081 is this service - and 8081 is also the
+  # Confluent default for the registry, which makes for a genuinely confusing
+  # afternoon if you let them collide.
+  schema-registry:
+    url: http://localhost:8085
+
   outbox:
     # Topic naming: <organisation>.<domain>.<event>.<major version>. The version
     # is in the NAME because a breaking schema change then becomes a new topic
     # that old consumers simply never see, rather than a poisoned message they
     # cannot parse. Part 3 adds a schema registry, which handles the compatible
     # changes; the topic version is for the incompatible ones.
-    topic: atlas.liquidity.buffer-changed.v1
+    # v2, and the bump is the versioning strategy doing its job. v1 carries JSON;
+    # v2 carries Avro. That is an INCOMPATIBLE change - an Avro consumer reading a
+    # JSON message finds no magic byte and fails - and an incompatible change is
+    # exactly what a version in the topic name is for. Compatible changes are the
+    # schema registry's job, and it will not let you make an incompatible one
+    # within a single topic.
+    #
+    # The practical benefit: v1 still exists, untouched, with its history intact.
+    # Nothing had to be migrated and no consumer was broken; they move over when
+    # they are ready, and v1 is retired when nobody reads it.
+    topic: atlas.liquidity.buffer-changed.v2
 
     # One second. Latency you would not accept for a user-facing read, and
     # completely unremarkable for asynchronous propagation - the position engine

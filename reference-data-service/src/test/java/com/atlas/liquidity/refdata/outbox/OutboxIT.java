@@ -91,7 +91,12 @@ class OutboxIT extends AbstractPostgresIntegrationTest {
         OutboxEventEntity row = events.get(0);
         assertThat(row.getAggregateType()).isEqualTo("SettlementAccount");
         assertThat(row.getEventType()).isEqualTo("LiquidityBufferChanged");
-        assertThat(row.getTopic()).isEqualTo("atlas.liquidity.buffer-changed.v1");
+        // Deliberately hardcoded rather than read from configuration. A topic
+        // rename is a breaking change for every consumer, so it should never be
+        // possible to make one quietly - and this assertion is what makes it
+        // impossible. It failed on the move from v1 to v2, which is the test
+        // doing its job rather than the test being in the way.
+        assertThat(row.getTopic()).isEqualTo("atlas.liquidity.buffer-changed.v2");
 
         // The partition key IS the account id, which is what gives a consumer
         // ordering per account. If this ever changes, ordering silently breaks

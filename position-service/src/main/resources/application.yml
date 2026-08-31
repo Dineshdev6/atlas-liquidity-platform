@@ -49,8 +49,22 @@ spring:
 # What this service listens to
 # ---------------------------------------------------------------------------
 atlas:
+  # LAYER 4 PART 3. The registry this service resolves schemas against.
+  #
+  # Note what this means at runtime: a message carries a schema ID, and the
+  # consumer fetches that schema (once, then caches it) to read the message with.
+  # So the registry being unreachable stops NEW schema versions from being read -
+  # it does not stop the consumer dead, which is a nicer failure mode than it
+  # first sounds.
+  schema-registry:
+    url: http://localhost:8085
+
   events:
-    buffer-changed-topic: atlas.liquidity.buffer-changed.v1
+    # v2: the Avro topic. v1 still exists with its JSON history, and this
+    # consumer simply no longer reads it. A version in the topic name is how you
+    # make an INCOMPATIBLE change without breaking anyone - compatible changes are
+    # the registry's job, and it will refuse an incompatible one within a topic.
+    buffer-changed-topic: atlas.liquidity.buffer-changed.v2
 
     # THE CONSUMER GROUP, and it is the most consequential string in this file.
     #
