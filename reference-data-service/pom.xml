@@ -27,7 +27,34 @@
           and change this single line. Nothing else depends on the number.
         -->
         <springdoc.version>2.8.5</springdoc.version>
+        <confluent.version>7.7.1</confluent.version>
     </properties>
+
+
+    <!--
+      CONFLUENT'S ARTEFACTS ARE NOT ON MAVEN CENTRAL.
+
+      kafka-avro-serializer and the schema-registry client are published only to
+      Confluent's own repository, so Maven has to be told about it explicitly.
+      This is a genuine operational detail rather than trivia: in a bank your
+      build talks to an internal Nexus or Artifactory that proxies Central, and
+      "the Confluent repo has not been mirrored yet" is a real ticket someone
+      raises on their first day.
+
+      Declared per-module rather than in the root POM only because the root POM
+      carries local edits we do not want to overwrite; a repository declaration
+      belongs in the parent in a real project - or better, in settings.xml, so
+      that switching to an internal mirror does not require touching every POM.
+    -->
+    <repositories>
+        <repository>
+            <id>confluent</id>
+            <name>Confluent</name>
+            <url>https://packages.confluent.io/maven/</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+    </repositories>
 
     <dependencies>
         <dependency>
@@ -77,6 +104,23 @@
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
         </dependency>
+
+        <!--
+          LAYER 4 PART 3: Avro over the wire, with the schema registry.
+
+          This one artefact brings KafkaAvroSerializer/Deserializer and the
+          registry client, and transitively the Avro runtime. Version 7.7.x is a
+          Confluent Platform version, not a Kafka version - Confluent 7.7 tracks
+          Kafka 3.7, and the serialisers are perfectly happy against the 3.9
+          broker we run, because they only speak the ordinary producer/consumer
+          protocol plus HTTP to the registry.
+        -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>${confluent.version}</version>
+        </dependency>
+
 
         <!-- LAYER 2: persistence -->
 

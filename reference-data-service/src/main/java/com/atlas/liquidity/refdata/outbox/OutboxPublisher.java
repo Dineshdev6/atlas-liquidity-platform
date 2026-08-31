@@ -55,11 +55,15 @@ public class OutboxPublisher {
     private static final long SEND_TIMEOUT_SECONDS = 10;
 
     private final OutboxEventJpaRepository outbox;
-    private final KafkaTemplate<String, String> kafka;
+    private final KafkaTemplate<String, Object> kafka;
+    private final OutboxAvroSerialiser avro;
 
-    OutboxPublisher(OutboxEventJpaRepository outbox, KafkaTemplate<String, String> kafka) {
+    OutboxPublisher(OutboxEventJpaRepository outbox,
+                    KafkaTemplate<String, Object> kafka,
+                    OutboxAvroSerialiser avro) {
         this.outbox = outbox;
         this.kafka = kafka;
+        this.avro = avro;
     }
 
     /**
@@ -111,11 +115,23 @@ public class OutboxPublisher {
 
     private boolean send(OutboxEventEntity event) {
         try {
+            // LAYER 4 PART 3. The stored payload is domain JSON; what goes on the
+            // wire is Avro, and the serialiser registers the schema with the
+            // registry the first time it sees it. Converting here rather than when
+            // the event was recorded keeps the registry off the business write
+            // path - see OutboxAvroSerialiser for the argument.
+            Object payload = avro.toAvro(event.getEventType(), event.getPayload());
+
             // The KEY is the partition key. This single argument is what gives
             // per-account ordering: Kafka hashes the key to choose a partition and
             // guarantees order within a partition. A null key round-robins and the
             // guarantee quietly disappears.
-            kafka.send(event.getTopic(), event.getPartitionKey(), event.getPayload())
+            //
+            // Note the key is still a plain String, not Avro. Keys and values are
+            // serialised independently, and a String key stays readable in every
+            // console tool - which matters more for a key you will grep for than
+            // the handful of bytes an Avro key would save.
+            kafka.send(event.getTopic(), event.getPartitionKey(), payload)
                     .get(SEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             return true;
         } catch (InterruptedException e) {
@@ -124,6 +140,13 @@ public class OutboxPublisher {
             // graceful shutdown into a hang.
             Thread.currentThread().interrupt();
             log.warn("Interrupted while publishing outbox event {}", event.getEventId());
+            return false;
+        } catch (IllegalStateException e) {
+            // Thrown by the Avro mapping when an event type has no mapping, or by
+            // the serialiser when the registry rejects the schema. Neither gets
+            // better on a retry, so it is logged loudly and the row is left for a
+            // human - a deliberate contrast with the transient case below.
+            log.error("Cannot publish outbox event {}: {}", event.getEventId(), e.getMessage(), e);
             return false;
         } catch (ExecutionException | TimeoutException e) {
             // Not an error. The event is still in the table, still unpublished,

@@ -77,5 +77,11 @@ logging:
 # The scheduling is trivial and framework-owned; the publishing logic is ours,
 # and that is what deserves the test.
 atlas:
+  # No integration test publishes, so nothing here contacts the registry. Present
+  # so the producer bean can be built, and pointing at the same place production
+  # does so a typo in the real value would not be masked here.
+  schema-registry:
+    url: http://localhost:8085
+
   outbox:
     relay-enabled: false
